@@ -1,19 +1,33 @@
-# Moe
+<div align="center">
 
-**Better call Moe!** — a small CPU inference engine for sparse mixture-of-experts
-language models.
+<img src="assets/logo.svg" alt="Moe" width="560">
 
-One binary on Linux, macOS and Windows. ~3,100 lines of Rust, no BLAS, no GPU,
-no Python at runtime. Point it at a Hugging Face repo and it downloads, caches,
-and works out what the model is by reading the weights.
+### Every expert on tap.
+
+CPU inference for sparse mixture-of-experts models.<br>
+One binary. Linux, macOS, Windows. No GPU, no BLAS, no Python.
+
+[![ci](https://img.shields.io/github/actions/workflow/status/JGalego/Moe/ci.yml?branch=main&style=flat-square&label=ci&color=3ee0d0)](https://github.com/JGalego/Moe/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/JGalego/Moe?style=flat-square&color=ffb02e&label=release)](https://github.com/JGalego/Moe/releases/latest)
+[![platforms](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-8b95a6?style=flat-square)](#install)
+[![rust](https://img.shields.io/badge/rust-1.75%2B-ffb02e?style=flat-square)](https://www.rust-lang.org)
+[![gpu](https://img.shields.io/badge/GPU-not%20required-3ee0d0?style=flat-square)](#why-another-engine)
+[![license](https://img.shields.io/badge/license-MIT-8b95a6?style=flat-square)](LICENSE)
+
+</div>
+
+---
+
+**Better call Moe!** Point it at a Hugging Face repo and it downloads, caches, and
+works out what the model is by reading the weights — no config file, no conversion
+step, no `--model-type`. About 3,100 lines of Rust.
 
 ```console
 $ moe run mistralai/Mixtral-8x7B-v0.1 -p "A sparse model is one where" -n 64
 ```
 
-That is the whole setup: no config file, no conversion step, no `--model-type`.
-The weights are fetched once with a progress bar, cached, and reused instantly on
-the next run.
+That is the whole setup. The weights are fetched once with a progress bar, cached,
+and reused instantly on every run after that.
 
 ```console
 $ moe info ~/models/mixtral
