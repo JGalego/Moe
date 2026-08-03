@@ -18,6 +18,7 @@
 //! # }
 //! ```
 
+pub mod fetch;
 pub mod model;
 pub mod quant;
 pub mod sample;
@@ -25,6 +26,7 @@ pub mod spec;
 pub mod store;
 pub mod tokenizer;
 
+pub use fetch::{cache_dir, resolve, Source};
 pub use model::{Model, State, Stats};
 pub use quant::{Dt, QT};
 pub use sample::{Rng, Sampler};

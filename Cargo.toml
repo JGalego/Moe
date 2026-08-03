@@ -14,10 +14,20 @@ path = "src/main.rs"
 name = "moe"
 path = "src/lib.rs"
 
+[features]
+default = ["fetch"]
+# Downloading models from URLs and the Hugging Face Hub. Turn it off for a
+# build with no TLS stack: `cargo build --no-default-features`.
+fetch = ["dep:ureq"]
+
 [dependencies]
 memmap2 = "0.9"
 rayon = "1.10"
 serde_json = "1"
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 opt-level = 3

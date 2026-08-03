@@ -7,16 +7,37 @@ on:
 
 jobs:
   test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+      # The engine must also build with no TLS stack and no downloads.
+      - run: cargo test --no-default-features
+
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: aarch64-apple-darwin, x86_64-pc-windows-msvc, aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      # Catch platform cfg mistakes without a cross toolchain.
+      - name: cross-check the engine
+        run: |
+          for t in aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-unknown-linux-gnu; do
+            cargo check --no-default-features --target "$t"
+          done
       # The reference implementation must keep running; its logits are not
       # diffed because libm rounding differs across platforms.
       - run: python3 scripts/oracle.py "$RUNNER_TEMP/fixtures"

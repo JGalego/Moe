@@ -1,4 +1,4 @@
-use moe::{human, peak_rss, tokenizer::Stream, Dt, Model, Rng, Sampler, State, Store, Tokenizer};
+use moe::{human, peak_rss, resolve, tokenizer::Stream, Dt, Model, Rng, Sampler, State, Store, Tokenizer};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -9,12 +9,20 @@ moe — CPU inference for sparse mixture-of-experts models
 
 USAGE
   moe run   <model> [options]        generate text
-  moe pack  <hf-dir> -o <out.moe>    re-quantise a checkpoint for fast loading
+  moe pull  <model>                  download a model into the cache
+  moe pack  <model> -o <out.moe>     re-quantise a checkpoint for fast loading
   moe info  <model>                  show detected architecture and footprint
   moe bench <model> [options]        measure prefill and decode throughput
   moe tokenize <model> -p TEXT       show token ids for a prompt
 
-<model> is a Hugging Face directory (config.json + *.safetensors) or a .moe file.
+<model> is any of:
+  ./model.moe                        a packed model file
+  ~/models/mixtral                   a directory of safetensors
+  mistralai/Mixtral-8x7B-v0.1        a Hugging Face repo, optionally @revision
+  https://host/path/model.moe        a direct download
+
+Remote models are cached; set MOE_CACHE to move the cache, HF_TOKEN to reach
+gated repos, and --offline to refuse to download.
 
 RUN OPTIONS
   -p, --prompt TEXT         prompt text
@@ -33,13 +41,15 @@ RUN OPTIONS
       --stats               per-run routing and throughput detail
 
 PACK OPTIONS
-  -o, --out PATH            output file                   [<hf-dir>.moe]
+  -o, --out PATH            output file                   [./<name>.moe]
       --quant FMT           dense weights: q4 q8 f16 f32  [q8]
       --expert-quant FMT    routed experts                [--quant]
 
 GLOBAL
       --threads N           worker threads                [all cores]
+      --offline             use the cache only, never download
   -h, --help                this message
+  -V, --version             version
 ";
 
 struct Args {
@@ -65,10 +75,11 @@ impl Args {
                     "n" => "tokens",
                     "o" => "out",
                     "h" => "help",
+                    "V" => "version",
                     k => k,
                 }
                 .to_string();
-                let flag = matches!(key.as_str(), "help" | "no-stream" | "stats" | "version");
+                let flag = matches!(key.as_str(), "help" | "no-stream" | "stats" | "version" | "offline");
                 let val = match inline {
                     Some(v) => v,
                     None if flag => "1".into(),
@@ -107,6 +118,10 @@ fn fail(msg: impl std::fmt::Display) -> ! {
 
 fn main() {
     let args = Args::parse();
+    if args.on("version") {
+        println!("moe {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if args.on("help") || args.cmd.is_empty() {
         print!("{USAGE}");
         return;
@@ -115,15 +130,34 @@ fn main() {
     if threads > 0 {
         let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global();
     }
-    let path = args.pos.first().map(PathBuf::from).unwrap_or_else(|| fail("expected a model path"));
+    let spec = args.pos.first().cloned().unwrap_or_else(|| fail("expected a model"));
+    if args.cmd == "pull" {
+        let path = fetched(&args, &spec);
+        println!("{}", path.display());
+        return;
+    }
+    let path = fetched(&args, &spec);
 
     match args.cmd.as_str() {
         "run" => run(&args, &path),
         "bench" => bench(&args, &path),
         "info" => info(&path),
-        "pack" => pack(&args, &path),
+        "pack" => pack(&args, &path, &spec),
         "tokenize" => tokenize(&args, &path),
         other => fail(format!("unknown command '{other}' (try --help)")),
+    }
+}
+
+/// Resolve a model spec to a local path, downloading it if necessary.
+fn fetched(args: &Args, spec: &str) -> PathBuf {
+    resolve(spec, args.on("offline")).unwrap_or_else(|e| fail(e))
+}
+
+/// Peak RSS as a display fragment, empty where the OS does not report it.
+fn rss_note(sep: &str) -> String {
+    match peak_rss() {
+        0 => String::new(),
+        b => format!("{sep}peak rss {}", human(b)),
     }
 }
 
@@ -146,13 +180,17 @@ fn info(path: &Path) {
     println!("source     {} ({})", m.store.path.display(), if m.store.packed { "packed" } else { "safetensors" });
 }
 
-fn pack(args: &Args, path: &Path) {
+fn pack(args: &Args, path: &Path, spec: &str) {
     let dt = |k: &str, d: Dt| {
         args.get(k).map(|v| Dt::parse(v).unwrap_or_else(|| fail(format!("unknown format '{v}'")))).unwrap_or(d)
     };
     let weight = dt("quant", Dt::Q8);
     let expert = dt("expert-quant", weight);
-    let out = args.get("out").map(PathBuf::from).unwrap_or_else(|| path.with_extension("moe"));
+    // Default to <name>.moe in the working directory, never inside the cache.
+    let out = args.get("out").map(PathBuf::from).unwrap_or_else(|| {
+        let name = spec.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("model");
+        PathBuf::from(format!("{}.moe", name.trim_end_matches(".moe")))
+    });
     let store = Store::open(path).unwrap_or_else(|e| fail(e));
     println!("packing {} -> {} (dense {}, experts {})", path.display(), out.display(), weight.name(), expert.name());
     let t0 = Instant::now();
@@ -300,12 +338,12 @@ fn run(args: &Args, path: &Path) {
     }
     println!();
     eprintln!(
-        "\nload {load_s:.2}s | prefill {} tok in {prefill_s:.2}s ({:.1} tok/s) | decode {} tok in {decode_s:.2}s ({:.2} tok/s) | peak rss {}",
+        "\nload {load_s:.2}s | prefill {} tok in {prefill_s:.2}s ({:.1} tok/s) | decode {} tok in {decode_s:.2}s ({:.2} tok/s){}",
         ids.len(),
         ids.len() as f32 / prefill_s.max(1e-6),
         out.len(),
         out.len() as f32 / decode_s.max(1e-6),
-        human(peak_rss()),
+        rss_note(" | "),
     );
     if args.on("stats") {
         eprintln!(
@@ -364,9 +402,9 @@ fn bench(args: &Args, path: &Path) {
         1000.0 * dc / n as f32
     );
     println!(
-        "threads  {}   expert reuse {:.0}%   peak rss {}",
+        "threads  {}   expert reuse {:.0}%{}",
         rayon::current_num_threads(),
         100.0 * st.stats.reuse_rate(),
-        human(peak_rss())
+        rss_note("   ")
     );
 }

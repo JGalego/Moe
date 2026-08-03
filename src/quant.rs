@@ -267,6 +267,32 @@ unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
     out
 }
 
+/// NEON is part of the aarch64 baseline, so this needs no runtime check.
+#[cfg(target_arch = "aarch64")]
+fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let n = a.len();
+    unsafe {
+        let (mut acc0, mut acc1) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+        let mut i = 0;
+        while i + 8 <= n {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(a.as_ptr().add(i)), vld1q_f32(b.as_ptr().add(i)));
+            acc1 = vfmaq_f32(acc1, vld1q_f32(a.as_ptr().add(i + 4)), vld1q_f32(b.as_ptr().add(i + 4)));
+            i += 8;
+        }
+        while i + 4 <= n {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(a.as_ptr().add(i)), vld1q_f32(b.as_ptr().add(i)));
+            i += 4;
+        }
+        let mut out = vaddvq_f32(vaddq_f32(acc0, acc1));
+        while i < n {
+            out += a[i] * b[i];
+            i += 1;
+        }
+        out
+    }
+}
+
 /// Dot product of two equal-length f32 slices.
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -277,6 +303,11 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
             return unsafe { dot_avx2(a, b) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return dot_neon(a, b);
+    }
+    #[allow(unreachable_code)]
     // Four independent accumulators so the scalar path still pipelines and
     // auto-vectorises (this is the hot loop on aarch64).
     let mut acc = [0.0f32; 4];

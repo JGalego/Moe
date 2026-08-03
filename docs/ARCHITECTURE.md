@@ -3,14 +3,35 @@
 Seven files, one binary. This is the tour.
 
 ```
-main.rs      CLI: run, pack, info, bench, tokenize
-  store.rs   where weights live      -> mmap safetensors / .moe, tensor views
-  spec.rs    what the model is       -> shape detection from config + tensors
-  model.rs   the forward pass        -> attention, routing, experts
-  quant.rs   the arithmetic          -> block formats, dequant + matmul kernels
+main.rs      CLI: run, pull, pack, info, bench, tokenize
+  fetch.rs   where the model comes from -> paths, URLs, Hub repos, the cache
+  store.rs   where weights live         -> mmap safetensors / .moe, tensor views
+  spec.rs    what the model is          -> shape detection from config + tensors
+  model.rs   the forward pass           -> attention, routing, experts
+  quant.rs   the arithmetic             -> block formats, dequant + matmul kernels
   tokenizer.rs  text <-> ids
   sample.rs  ids <- logits
 ```
+
+## Resolution
+
+Every command takes a model spec and turns it into a local path before anything
+else happens. A spec that exists on disk is used as-is; otherwise `owner/name` is
+a Hub repo (with `@revision`, or `hf:` to force the reading), and an `http(s)`
+URL is a download — except a Hub *model page*, which is recognised and treated as
+the repo it names.
+
+Repo snapshots take only what inference reads: `config.json`, `tokenizer.json`
+and top-level `*.safetensors`, or a published `.moe` on its own if the repo has
+one. Subdirectories are skipped, which is what keeps ONNX exports, GGUF
+conversions and `.bin` duplicates out of the download. Each file is written to a
+`.part` and renamed on completion, and a file already present at the expected
+size is skipped, so an interrupted download costs one file rather than the lot.
+
+Downloads honour `HTTPS_PROXY` and `SSL_CERT_FILE`, so a machine behind a
+corporate proxy needs no rebuild, and `HF_TOKEN` for gated repos. The whole
+module sits behind the `fetch` feature: `--no-default-features` builds an engine
+with no TLS stack that takes local paths only.
 
 ## Storage
 
@@ -76,9 +97,9 @@ for each row r (in parallel bands):
 That has three consequences. Adding a format means adding a `dequant` arm, not a
 kernel. The dequantisation cost is amortised across the batch, so prefill reads
 each weight once instead of once per token. And there is exactly one hot loop to
-optimise — `dot` — which has a hand-written AVX2/FMA path with two accumulators
-and a scalar fallback shaped to autovectorise. The scratch buffer is `cols` f32,
-which stays in L1 for realistic hidden sizes.
+optimise — `dot` — which has hand-written AVX2/FMA (detected at runtime) and NEON
+paths, plus a scalar fallback shaped to autovectorise. The scratch buffer is
+`cols` f32, which stays in L1 for realistic hidden sizes.
 
 Rows are split into bands across the rayon pool; results accumulate row-major and
 are transposed once at the end, an `O(rows * t)` shuffle next to `O(rows * cols *

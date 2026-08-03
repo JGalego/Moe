@@ -3,9 +3,17 @@
 **Better call Moe!** — a small CPU inference engine for sparse mixture-of-experts
 language models.
 
-One binary, ~2,700 lines of Rust, three dependencies, no BLAS, no GPU, no Python
-at runtime. Point it at a Hugging Face checkpoint and it works out what the model
-is by reading the weights.
+One binary on Linux, macOS and Windows. ~3,100 lines of Rust, no BLAS, no GPU,
+no Python at runtime. Point it at a Hugging Face repo and it downloads, caches,
+and works out what the model is by reading the weights.
+
+```console
+$ moe run mistralai/Mixtral-8x7B-v0.1 -p "A sparse model is one where" -n 64
+```
+
+That is the whole setup: no config file, no conversion step, no `--model-type`.
+The weights are fetched once with a progress bar, cached, and reused instantly on
+the next run.
 
 ```console
 $ moe info ~/models/mixtral
@@ -20,8 +28,6 @@ weights    995 tensors, 86.99 GB
   formats  BF16 86.99 GB
 kv cache   256.00 MB per 1k tokens
 source     /home/you/models/mixtral (safetensors)
-
-$ moe run ~/models/mixtral -p "A sparse model is one where" -n 64
 ```
 
 *(That is the layout `moe info` prints. The figures are computed from
@@ -53,30 +59,56 @@ bytes. Moe is built around that one observation:
 
 ## Install
 
-Needs a Rust toolchain (1.75+). Nothing else.
+A single binary with no runtime dependencies. Linux, macOS and Windows, x86-64
+and arm64.
 
 ```console
-$ cargo build --release        # target/release/moe
-$ cargo test                   # full suite, no checkpoint needed, ~2s
+# macOS / Linux
+$ curl -fsSL https://raw.githubusercontent.com/JGalego/Moe/main/install.sh | sh
+
+# Windows (PowerShell)
+> irm https://raw.githubusercontent.com/JGalego/Moe/main/install.ps1 | iex
 ```
 
-For the best kernels on your own machine, build with
-`RUSTFLAGS="-C target-cpu=native" cargo build --release`.
+Or from source, with a Rust toolchain (1.75+):
+
+```console
+$ cargo install --git https://github.com/JGalego/Moe    # or: cargo build --release
+$ cargo test                                            # full suite, no downloads, ~2s
+```
+
+Building from source compiles a TLS stack, which wants a C compiler. If you do
+not have one — or do not want downloads at all — `--no-default-features` drops
+both, leaving an engine that takes local paths. For the best kernels on your own
+machine, build with `RUSTFLAGS="-C target-cpu=native"`.
 
 ## Use
 
-Run straight from a Hugging Face download:
+`<model>` is whatever you have:
 
 ```console
-$ moe run ~/models/mixtral -p "The capital of France is" -n 40 --temp 0.7
+$ moe run mistralai/Mixtral-8x7B-v0.1 -p "The capital of France is"   # Hub repo
+$ moe run mistralai/Mixtral-8x7B-v0.1@refs/pr/7 -p ...                # a revision
+$ moe run ~/models/mixtral -p ... --temp 0.7                          # local directory
+$ moe run ./mixtral.moe -p ...                                        # packed file
+$ moe run https://example.com/mixtral.moe -p ...                      # direct download
 ```
 
-Or pack it first. Packing re-quantises every weight, drops tensors inference
+Remote models are downloaded once into a cache — `%LOCALAPPDATA%\moe` on
+Windows, `~/Library/Caches/moe` on macOS, `$XDG_CACHE_HOME/moe` or `~/.cache/moe`
+elsewhere — and reused after that. `MOE_CACHE` moves it, `HF_TOKEN` reaches gated
+repos, `--offline` refuses to download, and `moe pull <model>` fetches without
+running anything. From a repo, only the files inference reads are downloaded:
+`config.json`, `tokenizer.json` and the weights, skipping the `.bin` duplicates,
+demos and conversions that repos accumulate. If the repo publishes a packed
+`.moe`, that is taken on its own instead.
+
+Then pack it, if you like. Packing re-quantises every weight, drops tensors inference
 never reads, and embeds `tokenizer.json`, giving one self-contained file:
 
 ```console
-$ moe pack ~/models/mixtral -o mixtral.moe --quant q8 --expert-quant q4
-$ moe run mixtral.moe -p "Explain routing in one sentence." -n 80 --stats
+$ moe pack mistralai/Mixtral-8x7B-v0.1 --quant q8 --expert-quant q4
+$ moe run ./Mixtral-8x7B-v0.1.moe -p "Explain routing in one sentence." --stats
 ```
 
 `--quant` covers the dense trunk, `--expert-quant` the routed experts. Since the
@@ -89,9 +121,10 @@ straight into routing decisions.
 Other commands:
 
 ```console
-$ moe info  model.moe                  # architecture, footprint, kv cache size
-$ moe bench model.moe -n 64            # prefill and decode throughput
-$ moe tokenize model.moe -p "hello"    # token ids, for debugging
+$ moe pull  <model>                    # download into the cache, print the path
+$ moe info  <model>                    # architecture, footprint, kv cache size
+$ moe bench <model> -n 64              # prefill and decode throughput
+$ moe tokenize <model> -p "hello"      # token ids, for debugging
 $ moe --help                           # every flag
 ```
 
@@ -157,13 +190,14 @@ goes. The short version:
 
 | File | Lines | Role |
 | --- | --- | --- |
-| `src/quant.rs` | 380 | block formats, dequantise + matmul kernels, AVX2 dot |
+| `src/quant.rs` | 411 | block formats, dequantise + matmul kernels, AVX2 and NEON |
 | `src/store.rs` | 317 | mmap safetensors and `.moe`, tensor views, packing |
 | `src/spec.rs` | 205 | architecture detection from config + tensor shapes |
 | `src/model.rs` | 629 | weight binding and the forward pass |
 | `src/tokenizer.rs` | 591 | `tokenizer.json` BPE, both pre-tokenizer families |
+| `src/fetch.rs` | 361 | resolving paths, URLs and Hub repos; the download cache |
 | `src/sample.rs` | 127 | temperature, top-k, top-p, repetition penalty |
-| `src/main.rs` | 372 | CLI |
+| `src/main.rs` | 402 | CLI |
 
 ## Limitations
 
@@ -172,8 +206,11 @@ Worth knowing before you file an issue:
 - Attention is exact and quadratic in context; there is no flash-attention
   kernel and no paged KV cache. The KV cache is f32 and preallocated for `--ctx`.
 - Activations are always f32. Only weights are quantised.
-- Hand-written SIMD covers x86-64 AVX2/FMA; elsewhere the scalar kernels rely on
-  the autovectoriser, which is decent but not the same thing.
+- Hand-written SIMD covers x86-64 (AVX2/FMA, detected at runtime) and arm64
+  (NEON). Anywhere else the scalar kernels rely on the autovectoriser, which is
+  decent but not the same thing.
+- Downloads are resumed at file granularity, not byte ranges: an interrupted
+  file restarts, though completed ones are kept.
 - Throughput numbers are not quoted here because they depend entirely on your
   machine's memory bandwidth. Run `moe bench` and you will have real ones.
 
