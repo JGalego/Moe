@@ -18,10 +18,13 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-13
-            target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
+          # Cross-compiled from the arm64 runner: the macOS SDK is universal,
+          # and the macos-13 image this used to need is being retired, which
+          # would leave a release queued behind a runner that never arrives.
+          - os: macos-latest
+            target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
