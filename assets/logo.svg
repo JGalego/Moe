@@ -1,19 +1,124 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="158 52 324 142" width="324" height="142" role="img" aria-label="moe — every expert on tap">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="153 51 296 106" width="296" height="106" role="img" aria-label="moe">
   <title>moe</title>
-  <desc>The word moe, where the o is a ring of eight expert segments with two lit.</desc>
+  <desc>The word moe, where the o is a ring of eight experts with two lit at a time, the pair changing as routing does.</desc>
+  <style>
+  @keyframes e0 {
+    0% { stroke: #17b3a3; }
+    12.5% { stroke: #e0973a; }
+    25% { stroke: #e0973a; }
+    37.5% { stroke: #e0973a; }
+    50% { stroke: #17b3a3; }
+    62.5% { stroke: #e0973a; }
+    75% { stroke: #e0973a; }
+    87.5% { stroke: #e0973a; }
+    100% { stroke: #17b3a3; }
+  }
+  .e0 { animation: e0 4.8s step-end infinite; }
+  @keyframes e1 {
+    0% { stroke: #e0973a; }
+    12.5% { stroke: #17b3a3; }
+    25% { stroke: #e0973a; }
+    37.5% { stroke: #e0973a; }
+    50% { stroke: #e0973a; }
+    62.5% { stroke: #17b3a3; }
+    75% { stroke: #e0973a; }
+    87.5% { stroke: #e0973a; }
+    100% { stroke: #e0973a; }
+  }
+  .e1 { animation: e1 4.8s step-end infinite; }
+  @keyframes e2 {
+    0% { stroke: #e0973a; }
+    12.5% { stroke: #e0973a; }
+    25% { stroke: #17b3a3; }
+    37.5% { stroke: #e0973a; }
+    50% { stroke: #e0973a; }
+    62.5% { stroke: #e0973a; }
+    75% { stroke: #17b3a3; }
+    87.5% { stroke: #e0973a; }
+    100% { stroke: #e0973a; }
+  }
+  .e2 { animation: e2 4.8s step-end infinite; }
+  @keyframes e3 {
+    0% { stroke: #e0973a; }
+    12.5% { stroke: #e0973a; }
+    25% { stroke: #e0973a; }
+    37.5% { stroke: #17b3a3; }
+    50% { stroke: #e0973a; }
+    62.5% { stroke: #e0973a; }
+    75% { stroke: #e0973a; }
+    87.5% { stroke: #17b3a3; }
+    100% { stroke: #e0973a; }
+  }
+  .e3 { animation: e3 4.8s step-end infinite; }
+  @keyframes e4 {
+    0% { stroke: #17b3a3; }
+    12.5% { stroke: #e0973a; }
+    25% { stroke: #e0973a; }
+    37.5% { stroke: #e0973a; }
+    50% { stroke: #e0973a; }
+    62.5% { stroke: #e0973a; }
+    75% { stroke: #e0973a; }
+    87.5% { stroke: #17b3a3; }
+    100% { stroke: #17b3a3; }
+  }
+  .e4 { animation: e4 4.8s step-end infinite; }
+  @keyframes e5 {
+    0% { stroke: #e0973a; }
+    12.5% { stroke: #17b3a3; }
+    25% { stroke: #e0973a; }
+    37.5% { stroke: #e0973a; }
+    50% { stroke: #17b3a3; }
+    62.5% { stroke: #e0973a; }
+    75% { stroke: #e0973a; }
+    87.5% { stroke: #e0973a; }
+    100% { stroke: #e0973a; }
+  }
+  .e5 { animation: e5 4.8s step-end infinite; }
+  @keyframes e6 {
+    0% { stroke: #e0973a; }
+    12.5% { stroke: #e0973a; }
+    25% { stroke: #17b3a3; }
+    37.5% { stroke: #e0973a; }
+    50% { stroke: #e0973a; }
+    62.5% { stroke: #17b3a3; }
+    75% { stroke: #e0973a; }
+    87.5% { stroke: #e0973a; }
+    100% { stroke: #e0973a; }
+  }
+  .e6 { animation: e6 4.8s step-end infinite; }
+  @keyframes e7 {
+    0% { stroke: #e0973a; }
+    12.5% { stroke: #e0973a; }
+    25% { stroke: #e0973a; }
+    37.5% { stroke: #17b3a3; }
+    50% { stroke: #e0973a; }
+    62.5% { stroke: #e0973a; }
+    75% { stroke: #17b3a3; }
+    87.5% { stroke: #e0973a; }
+    100% { stroke: #e0973a; }
+  }
+  .e7 { animation: e7 4.8s step-end infinite; }
+    @media (prefers-reduced-motion: reduce) {
+      .e0 { animation: none; stroke: #17b3a3; }
+      .e1 { animation: none; stroke: #e0973a; }
+      .e2 { animation: none; stroke: #e0973a; }
+      .e3 { animation: none; stroke: #e0973a; }
+      .e4 { animation: none; stroke: #17b3a3; }
+      .e5 { animation: none; stroke: #e0973a; }
+      .e6 { animation: none; stroke: #e0973a; }
+      .e7 { animation: none; stroke: #e0973a; }
+    }
+  </style>
   <g font-family="'Trebuchet MS','Helvetica Neue',Helvetica,Arial,sans-serif" font-weight="700" font-size="128" fill="#e0973a">
     <text x="276" y="138" text-anchor="end" letter-spacing="-1">m</text>
     <text x="364" y="138" text-anchor="start" letter-spacing="-1">e</text>
   </g>
-  <path d="M321.70 77.05 A27.0 27.0 0 0 1 337.86 83.75" fill="none" stroke="#e0973a" stroke-width="14.0" stroke-linecap="butt"/>
-  <path d="M340.25 86.14 A27.0 27.0 0 0 1 346.95 102.30" fill="none" stroke="#17b3a3" stroke-width="14.0" stroke-linecap="butt"/>
-  <path d="M346.95 105.70 A27.0 27.0 0 0 1 340.25 121.86" fill="none" stroke="#e0973a" stroke-width="14.0" stroke-linecap="butt"/>
-  <path d="M337.86 124.25 A27.0 27.0 0 0 1 321.70 130.95" fill="none" stroke="#e0973a" stroke-width="14.0" stroke-linecap="butt"/>
-  <path d="M318.30 130.95 A27.0 27.0 0 0 1 302.14 124.25" fill="none" stroke="#e0973a" stroke-width="14.0" stroke-linecap="butt"/>
-  <path d="M299.75 121.86 A27.0 27.0 0 0 1 293.05 105.70" fill="none" stroke="#17b3a3" stroke-width="14.0" stroke-linecap="butt"/>
-  <path d="M293.05 102.30 A27.0 27.0 0 0 1 299.75 86.14" fill="none" stroke="#e0973a" stroke-width="14.0" stroke-linecap="butt"/>
-  <path d="M302.14 83.75 A27.0 27.0 0 0 1 318.30 77.05" fill="none" stroke="#e0973a" stroke-width="14.0" stroke-linecap="butt"/>
-  <text x="320" y="176" text-anchor="middle" font-size="13" font-weight="600"
-        font-family="'Trebuchet MS','Helvetica Neue',Helvetica,Arial,sans-serif"
-        fill="#8892a2" letter-spacing="5.2">EVERY EXPERT ON TAP</text>
+  <path class="e0" d="M321.70 77.05 A27.0 27.0 0 0 1 337.86 83.75" fill="none" stroke="#e0973a" stroke-width="14.0" stroke-linecap="butt"/>
+  <path class="e1" d="M340.25 86.14 A27.0 27.0 0 0 1 346.95 102.30" fill="none" stroke="#e0973a" stroke-width="14.0" stroke-linecap="butt"/>
+  <path class="e2" d="M346.95 105.70 A27.0 27.0 0 0 1 340.25 121.86" fill="none" stroke="#e0973a" stroke-width="14.0" stroke-linecap="butt"/>
+  <path class="e3" d="M337.86 124.25 A27.0 27.0 0 0 1 321.70 130.95" fill="none" stroke="#e0973a" stroke-width="14.0" stroke-linecap="butt"/>
+  <path class="e4" d="M318.30 130.95 A27.0 27.0 0 0 1 302.14 124.25" fill="none" stroke="#e0973a" stroke-width="14.0" stroke-linecap="butt"/>
+  <path class="e5" d="M299.75 121.86 A27.0 27.0 0 0 1 293.05 105.70" fill="none" stroke="#e0973a" stroke-width="14.0" stroke-linecap="butt"/>
+  <path class="e6" d="M293.05 102.30 A27.0 27.0 0 0 1 299.75 86.14" fill="none" stroke="#e0973a" stroke-width="14.0" stroke-linecap="butt"/>
+  <path class="e7" d="M302.14 83.75 A27.0 27.0 0 0 1 318.30 77.05" fill="none" stroke="#e0973a" stroke-width="14.0" stroke-linecap="butt"/>
 </svg>

@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="moe" width="360">
+<img src="assets/logo.svg" alt="moe" width="330">
 
 ### Every expert on tap.
 
