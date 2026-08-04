@@ -20,6 +20,16 @@ jobs:
       # The engine must also build with no TLS stack and no downloads.
       - run: cargo test --no-default-features
 
+  # The README and Cargo.toml promise a minimum Rust version; hold them to it.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+      - run: cargo check --all-targets --no-default-features
+
   lint:
     runs-on: ubuntu-latest
     steps:

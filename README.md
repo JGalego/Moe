@@ -10,7 +10,7 @@ One binary. Linux, macOS, Windows. No GPU, no BLAS, no Python.
 [![ci](https://img.shields.io/github/actions/workflow/status/JGalego/Moe/ci.yml?branch=main&style=flat-square&label=ci&color=17b3a3)](https://github.com/JGalego/Moe/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/JGalego/Moe?style=flat-square&color=e0973a&label=release)](https://github.com/JGalego/Moe/releases/latest)
 [![platforms](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-8b95a6?style=flat-square)](#install)
-[![rust](https://img.shields.io/badge/rust-1.75%2B-e0973a?style=flat-square)](https://www.rust-lang.org)
+[![rust](https://img.shields.io/badge/rust-1.85%2B-e0973a?style=flat-square)](https://www.rust-lang.org)
 [![gpu](https://img.shields.io/badge/GPU-not%20required-17b3a3?style=flat-square)](#why-another-engine)
 [![license](https://img.shields.io/badge/license-MIT-8b95a6?style=flat-square)](LICENSE)
 
@@ -65,7 +65,7 @@ $ curl -fsSL https://raw.githubusercontent.com/JGalego/Moe/main/install.sh | sh
 > irm https://raw.githubusercontent.com/JGalego/Moe/main/install.ps1 | iex
 ```
 
-Or from source, with a Rust toolchain (1.75+):
+Or from source, with a Rust toolchain (1.85+):
 
 ```console
 $ cargo install --git https://github.com/JGalego/Moe    # or: cargo build --release
