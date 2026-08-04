@@ -381,12 +381,18 @@ impl Model {
                     let p = base + i;
                     for (buf, heads, nrm) in [(&mut q, s.heads, &a.q_norm), (&mut k, n_kv, &a.k_norm)] {
                         let row = &mut buf[i * heads * qd..(i + 1) * heads * qd];
-                        for hh in row.chunks_mut(qd) {
-                            if let Some(w) = nrm {
-                                let mut tmp = vec![0.0; qd];
-                                rmsnorm(hh, w, s.eps, &mut tmp);
-                                hh.copy_from_slice(&tmp);
+                        // The norm's width says which convention the checkpoint
+                        // uses: one weight per head (Qwen3-style) or one across
+                        // the whole projection (OLMoE-style).
+                        if let Some(w) = nrm {
+                            let span = if w.len() == row.len() { row.len() } else { qd };
+                            let mut tmp = vec![0.0; span];
+                            for chunk in row.chunks_mut(span) {
+                                rmsnorm(chunk, w, s.eps, &mut tmp);
+                                chunk.copy_from_slice(&tmp);
                             }
+                        }
+                        for hh in row.chunks_mut(qd) {
                             rope(hh, p, s.theta, s.rope_scale);
                         }
                     }

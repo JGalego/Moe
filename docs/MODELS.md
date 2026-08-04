@@ -8,8 +8,9 @@ its tensors are in that shape and use recognisable names.
 
 - RMSNorm; SwiGLU feed-forward
 - Rotary embeddings, half-split layout, optional linear scaling factor
-- Grouped-query attention, with optional projection biases and optional
-  per-head qk-norm
+- Grouped-query attention, with optional projection biases and optional qk-norm,
+  applied per head or across the whole projection depending on how wide the
+  checkpoint's norm weight is
 - Multi-head latent attention: low-rank queries, compressed KV, decoupled rotary
   keys
 - Top-k routing with softmax or sigmoid scores, an optional correction bias,
@@ -63,17 +64,18 @@ default, so it is the one value that must be present.
 
 | Family | Notes | Status |
 | --- | --- | --- |
-| Mixtral | fused or per-expert weights, both handled | loaded, packed and generated from a real checkpoint |
+| OLMoE | whole-projection qk-norm, `norm_topk_prob: false` | run end to end on the real 7B checkpoint |
+| Mixtral | fused or per-expert weights, both handled | loaded, packed and generated from a random-weight checkpoint in that format |
 | Qwen2-MoE | shared expert with a sigmoid gate | expected; the mechanism is implemented and unit-tested, no checkpoint run |
-| Qwen3-MoE | qk-norm, fused experts | expected; same |
-| OLMoE | qk-norm, `norm_topk_prob: false` | expected; same |
+| Qwen3-MoE | per-head qk-norm, fused experts | expected; same |
 | DeepSeek-V2 / V3 | latent attention, sigmoid gating, group-limited routing, shared experts, dense prefix | every mechanism is covered by the reference test, but no real checkpoint has been run |
 | Dense Llama-style | no routed layers | works; it is the same path without routing |
 
-Only the Mixtral row means "a real checkpoint went through this binary". The rest
-say the implementation exists and is tested against an independent reference at
-toy scale. If one of them fails on a real file, `moe info` names the first tensor
-it could not resolve, which is nearly always the answer.
+Only the OLMoE row means "a real trained checkpoint went through this binary and
+produced correct text". The rest say the implementation exists and is tested
+against an independent reference at toy scale. If one of them fails on a real
+file, `moe info` names the first tensor it could not resolve, which is nearly
+always the answer.
 
 ## Not supported
 

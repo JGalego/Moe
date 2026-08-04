@@ -13,7 +13,7 @@ USAGE
   moe pack  <model> -o <out.moe>     re-quantise a checkpoint for fast loading
   moe info  <model>                  show detected architecture and footprint
   moe bench <model> [options]        measure prefill and decode throughput
-  moe tokenize <model> -p TEXT       show token ids for a prompt
+  moe tokenize <model> -p TEXT       show token ids (--decode 1,2,3 reverses it)
 
 <model> is any of:
   ./model.moe                        a packed model file
@@ -117,6 +117,11 @@ fn fail(msg: impl std::fmt::Display) -> ! {
 }
 
 fn main() {
+    // Let `moe info model | head` end quietly instead of panicking on EPIPE.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let args = Args::parse();
     if args.on("version") {
         println!("moe {}", env!("CARGO_PKG_VERSION"));
@@ -361,6 +366,11 @@ fn tokenize(args: &Args, path: &Path) {
     let store =
         if path.is_file() && path.extension().is_some_and(|e| e == "moe") { Store::open(path).ok() } else { None };
     let tok = tokenizer_for(args, path, store.as_ref()).unwrap_or_else(|| fail("no tokenizer found"));
+    if let Some(list) = args.get("decode") {
+        let ids: Vec<u32> = list.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        print!("{}", tok.decode(&ids));
+        return;
+    }
     let text = match (args.get("prompt"), args.get("prompt-file")) {
         (Some(t), _) => t.to_string(),
         (None, Some(f)) => std::fs::read_to_string(f).unwrap_or_else(|e| fail(format!("{f}: {e}"))),

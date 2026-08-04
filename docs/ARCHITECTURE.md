@@ -143,8 +143,10 @@ Per layer: RMSNorm, attention, residual, RMSNorm, feed-forward, residual.
 Both front-ends produce the same thing — per-head queries, keys and values —
 after which the causal softmax attention is shared.
 
-**Grouped-query.** `q`, `k`, `v` projections, optional biases, optional per-head
-qk-norm, then rotary embedding. Keys and values are appended to the cache. Query
+**Grouped-query.** `q`, `k`, `v` projections, optional biases, optional qk-norm,
+then rotary embedding. The norm's width picks the convention: a weight as wide as
+one head normalises each head separately, one as wide as the whole projection
+normalises it in a single pass. Keys and values are appended to the cache. Query
 head `h` reads kv head `h / (heads/kv_heads)`.
 
 **Latent.** Queries optionally pass through a low-rank bottleneck

@@ -59,8 +59,12 @@ pub struct Tokenizer {
     ranks: HashMap<(String, String), u32>,
     added: Vec<(String, u32)>,
     special: Vec<bool>,
+    /// Ids whose text is stored verbatim rather than byte-level encoded.
+    literal: Vec<bool>,
     pre: Pre,
     prefix_space: bool,
+    /// The decoder undoes `Prepend` by stripping one leading space.
+    strip_space: bool,
     split: Split,
     byte_dec: HashMap<char, u8>,
     byte_enc: Vec<char>,
@@ -144,6 +148,14 @@ impl Tokenizer {
         let prefix_space = norm.contains("\"Prepend\"")
             || desc.contains("prepend_scheme\":\"always")
             || (pre == Pre::Metaspace && desc.contains("add_prefix_space\":true"));
+        // A `Strip` in the decoder removes the separator `Prepend` added.
+        let strip_space = j["decoder"]["decoders"]
+            .as_array()
+            .map(|a| a.iter())
+            .into_iter()
+            .flatten()
+            .chain(std::iter::once(&j["decoder"]))
+            .any(|d| d["type"] == "Strip" && d["content"] == " " && d["start"].as_u64().unwrap_or(0) >= 1);
         let split = match find_regex(&j["pre_tokenizer"]) {
             Some(re) => Split {
                 word_any_prefix: re.contains("[^\\r\\n\\p{L}\\p{N}]?"),
@@ -165,6 +177,7 @@ impl Tokenizer {
         let n = vocab.values().copied().max().unwrap_or(0) as usize + 1;
         let mut tokens = vec![String::new(); n];
         let mut special = vec![false; n];
+        let mut literal = vec![false; n];
         for (t, i) in &vocab {
             tokens[*i as usize] = t.clone();
         }
@@ -175,6 +188,9 @@ impl Tokenizer {
             if (id as usize) < n {
                 tokens[id as usize] = c.to_string();
                 special[id as usize] = a["special"].as_bool().unwrap_or(false);
+                // Added tokens hold raw text: a vocabulary entry of four spaces
+                // is four spaces, not four byte-level codepoints.
+                literal[id as usize] = true;
             }
             added.push((c.to_string(), id));
         }
@@ -183,7 +199,20 @@ impl Tokenizer {
 
         let byte_enc = byte_table();
         let byte_dec = byte_enc.iter().enumerate().map(|(b, c)| (*c, b as u8)).collect();
-        Ok(Tokenizer { vocab, tokens, ranks, added, special, pre, prefix_space, split, byte_dec, byte_enc })
+        Ok(Tokenizer {
+            vocab,
+            tokens,
+            ranks,
+            added,
+            special,
+            literal,
+            pre,
+            prefix_space,
+            strip_space,
+            split,
+            byte_dec,
+            byte_enc,
+        })
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -192,6 +221,11 @@ impl Tokenizer {
 
     pub fn is_special(&self, id: u32) -> bool {
         self.special.get(id as usize).copied().unwrap_or(false)
+    }
+
+    /// Whether the checkpoint's decoder drops one leading space.
+    pub fn strips_leading_space(&self) -> bool {
+        self.strip_space
     }
 
     /// Length in chars of the piece starting at `i`, following the declared
@@ -358,26 +392,32 @@ impl Tokenizer {
         }
     }
 
+    /// Scan left to right, taking the longest added token that matches at each
+    /// position. Order matters: an earlier short match beats a later long one.
     pub fn encode(&self, text: &str, bos: Option<u32>) -> Vec<u32> {
         let mut ids = Vec::new();
         ids.extend(bos);
-        let mut rest = text;
-        'outer: while !rest.is_empty() {
-            for (content, id) in &self.added {
-                if let Some(at) = rest.find(content.as_str()) {
-                    if at == 0 {
-                        ids.push(*id);
-                        rest = &rest[content.len()..];
-                        continue 'outer;
-                    }
-                    self.encode_plain(&rest[..at], &mut ids);
-                    ids.push(*id);
-                    rest = &rest[at + content.len()..];
-                    continue 'outer;
-                }
+        let (mut start, mut i) = (0usize, 0usize);
+        while i < text.len() {
+            if !text.is_char_boundary(i) {
+                i += 1;
+                continue;
             }
-            self.encode_plain(rest, &mut ids);
-            break;
+            // `added` is sorted longest first, so the first hit is the longest.
+            match self.added.iter().find(|(c, _)| text[i..].starts_with(c.as_str())) {
+                Some((content, id)) => {
+                    if start < i {
+                        self.encode_plain(&text[start..i], &mut ids);
+                    }
+                    ids.push(*id);
+                    i += content.len();
+                    start = i;
+                }
+                None => i += 1,
+            }
+        }
+        if start < text.len() {
+            self.encode_plain(&text[start..], &mut ids);
         }
         ids
     }
@@ -407,6 +447,10 @@ impl Tokenizer {
     pub fn decode_bytes(&self, ids: &[u32], out: &mut Vec<u8>) {
         for id in ids {
             let Some(tok) = self.tokens.get(*id as usize) else { continue };
+            if self.literal.get(*id as usize).copied().unwrap_or(false) {
+                out.extend_from_slice(tok.as_bytes());
+                continue;
+            }
             match self.pre {
                 Pre::ByteLevel => out.extend(tok.chars().map(|c| *self.byte_dec.get(&c).unwrap_or(&b'?'))),
                 Pre::Metaspace => match tok
@@ -424,7 +468,11 @@ impl Tokenizer {
     pub fn decode(&self, ids: &[u32]) -> String {
         let mut b = Vec::new();
         self.decode_bytes(ids, &mut b);
-        String::from_utf8_lossy(&b).into_owned()
+        let text = String::from_utf8_lossy(&b);
+        match self.strip_space {
+            true => text.strip_prefix(' ').unwrap_or(&text).to_string(),
+            false => text.into_owned(),
+        }
     }
 
     /// Text of a single token, on its own. Prefer [`Stream`] when printing
@@ -439,6 +487,7 @@ impl Tokenizer {
 #[derive(Default)]
 pub struct Stream {
     buf: Vec<u8>,
+    started: bool,
 }
 
 impl Stream {
@@ -446,11 +495,16 @@ impl Stream {
     pub fn push(&mut self, tok: &Tokenizer, id: u32) -> String {
         tok.decode_bytes(&[id], &mut self.buf);
         let mut out = String::new();
+        // The decoder's leading-space strip applies once, at the very start.
+        if !self.started && tok.strips_leading_space() && self.buf.first() == Some(&b' ') {
+            self.buf.remove(0);
+        }
         loop {
             match std::str::from_utf8(&self.buf) {
                 Ok(s) => {
                     out.push_str(s);
                     self.buf.clear();
+                    self.started |= !out.is_empty();
                     return out;
                 }
                 Err(e) => {
@@ -573,6 +627,51 @@ mod tests {
         assert_eq!(t.encode("a", None), [0, 1]);
         assert_eq!(t.encode(" a", None), [0, 0, 1]);
         assert_eq!(t.decode(&[0, 1]), " a");
+    }
+
+    /// An added token holds raw text, so it must bypass the byte-level map on
+    /// the way out — a vocabulary entry of four spaces decodes to four spaces.
+    #[test]
+    fn added_tokens_decode_literally() {
+        let vocab = serde_json::json!({"a": 0, "b": 1, "    ": 7, "\n": 8});
+        let j = serde_json::json!({
+            "model": {"type": "BPE", "vocab": vocab, "merges": []},
+            "added_tokens": [
+                {"id": 7, "content": "    ", "special": false},
+                {"id": 8, "content": "\n", "special": false},
+            ],
+            "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+        });
+        let t = Tokenizer::from_json(&j).unwrap();
+        assert_eq!(t.decode(&[0, 7, 1]), "a    b");
+        assert_eq!(t.decode(&[8, 7, 0]), "\n    a");
+        let mut st = Stream::default();
+        let streamed: String = [0u32, 7, 1].iter().map(|i| st.push(&t, *i)).collect();
+        assert_eq!(streamed, "a    b");
+    }
+
+    /// A `Strip` in the decoder undoes the `Prepend` in the normaliser, so a
+    /// round trip does not gain a leading space.
+    #[test]
+    fn metaspace_decoder_strips_the_prepended_space() {
+        let j = serde_json::json!({
+            "model": {"type": "BPE", "vocab": {"\u{2581}": 0, "a": 1}, "merges": []},
+            "normalizer": {"type": "Sequence", "normalizers": [
+                {"type": "Prepend", "prepend": "\u{2581}"},
+                {"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"},
+            ]},
+            "decoder": {"type": "Sequence", "decoders": [
+                {"type": "Replace", "pattern": {"String": "\u{2581}"}, "content": " "},
+                {"type": "Strip", "content": " ", "start": 1, "stop": 0},
+            ]},
+        });
+        let t = Tokenizer::from_json(&j).unwrap();
+        assert!(t.strips_leading_space());
+        assert_eq!(t.decode(&t.encode("a", None)), "a");
+        assert_eq!(t.decode(&t.encode(" a", None)), " a");
+        let mut st = Stream::default();
+        let streamed: String = t.encode("a", None).iter().map(|i| st.push(&t, *i)).collect();
+        assert_eq!(streamed, "a");
     }
 
     #[test]

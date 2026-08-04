@@ -87,8 +87,22 @@ def main():
         if got != want:
             bad += 1
             if bad <= 10:
-                print(f"MISMATCH {text!r}\n  want {want}\n  got  {got}")
-    print(f"{len(cases) - bad}/{len(cases)} exact  ({args.tokenizer})")
+                print(f"ENCODE {text!r}\n  want {want}\n  got  {got}")
+            continue
+        # Decoding matters just as much: added tokens hold raw text and must not
+        # be pushed back through the byte-level map.
+        want_text = tk.decode(want)
+        # Bytes, not text: capturing as text would silently fold \r\n into \n.
+        proc = subprocess.run(
+            [args.bin, "tokenize", args.tokenizer, "--decode", ",".join(map(str, want))],
+            capture_output=True,
+        )
+        got_text = proc.stdout.decode("utf-8", "replace")
+        if got_text != want_text:
+            bad += 1
+            if bad <= 10:
+                print(f"DECODE {text!r}\n  want {want_text!r}\n  got  {got_text!r}")
+    print(f"{len(cases) - bad}/{len(cases)} exact, encode and decode  ({args.tokenizer})")
     return 1 if bad else 0
 
 

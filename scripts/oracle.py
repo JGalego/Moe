@@ -82,8 +82,13 @@ def mlp(w, prefix, x):
 # ---------------------------------------------------------------- fixtures
 
 
-def build_gqa(rng):
-    """Grouped-query attention, qk-norm, softmax routing, no dense layers."""
+def build_gqa(rng, full_norm=False):
+    """Grouped-query attention, qk-norm, softmax routing, no dense layers.
+
+    `full_norm` switches qk-norm from one weight per head (Qwen3-style) to one
+    across the whole projection (OLMoE-style). Only the weight's width says
+    which is meant, so both have to be exercised.
+    """
     cfg = dict(
         architectures=["MoeForCausalLM"],
         model_type="moe",
@@ -117,8 +122,8 @@ def build_gqa(rng):
         w[p + "self_attn.k_proj.weight"] = rng.mat(nkv * hd, h)
         w[p + "self_attn.v_proj.weight"] = rng.mat(nkv * hd, h)
         w[p + "self_attn.o_proj.weight"] = rng.mat(h, nh * hd)
-        w[p + "self_attn.q_norm.weight"] = rng.vec(hd, 0.2, 1.0)
-        w[p + "self_attn.k_norm.weight"] = rng.vec(hd, 0.2, 1.0)
+        w[p + "self_attn.q_norm.weight"] = rng.vec(nh * hd if full_norm else hd, 0.2, 1.0)
+        w[p + "self_attn.k_norm.weight"] = rng.vec(nkv * hd if full_norm else hd, 0.2, 1.0)
         w[p + "mlp.gate.weight"] = rng.mat(cfg["num_experts"], h)
         for e in range(cfg["num_experts"]):
             q = p + f"mlp.experts.{e}."
@@ -270,6 +275,12 @@ def forward(cfg, w, tokens):
                 vflat = matvec(w[p + "self_attn.v_proj.weight"], n)
                 qn = w.get(p + "self_attn.q_norm.weight")
                 kn = w.get(p + "self_attn.k_norm.weight")
+                # A norm as wide as the whole projection applies once, before
+                # the heads are split apart.
+                if qn and len(qn) == len(qflat):
+                    qflat, qn = rmsnorm(qflat, qn, eps), None
+                if kn and len(kn) == len(kflat):
+                    kflat, kn = rmsnorm(kflat, kn, eps), None
                 qs, ks, vs = [], [], []
                 for hi in range(nh):
                     qh = qflat[hi * hd:(hi + 1) * hd]
@@ -344,7 +355,12 @@ def write_safetensors(path, w):
 
 def main():
     root = sys.argv[1] if len(sys.argv) > 1 else "tests/fixtures"
-    for name, build in (("gqa", build_gqa), ("mla", build_mla)):
+    builders = (
+        ("gqa", build_gqa),
+        ("gqa_fullnorm", lambda rng: build_gqa(rng, full_norm=True)),
+        ("mla", build_mla),
+    )
+    for name, build in builders:
         cfg, w = build(Rand(0x5EED + len(name)))
         d = os.path.join(root, name)
         os.makedirs(d, exist_ok=True)

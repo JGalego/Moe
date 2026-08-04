@@ -22,30 +22,12 @@ One binary. Linux, macOS, Windows. No GPU, no BLAS, no Python.
 works out what the model is by reading the weights — no config file, no conversion
 step, no `--model-type`. About 3,100 lines of Rust.
 
-```console
-$ moe run mistralai/Mixtral-8x7B-v0.1 -p "A sparse model is one where" -n 64
-```
+![moe run](assets/run.gif)
 
 The weights are fetched once with a progress bar, cached, and reused instantly on
 every run after that.
 
-```console
-$ moe info ~/models/mixtral
-MixtralForCausalLM
-  layers 32  hidden 4096  vocab 32000
-  attention  GQA(32 q / 8 kv heads, head_dim=128)
-  ffn        8 experts, top-2, softmax gate
-
-weights    995 tensors, 86.99 GB
-  dense    2.99 GB
-  experts  84.00 GB (97%)
-  formats  BF16 86.99 GB
-kv cache   256.00 MB per 1k tokens
-source     /home/you/models/mixtral (safetensors)
-```
-
-*(Figures computed from Mixtral-8x7B's published shapes rather than measured on a
-run — 97% of the checkpoint is expert weights, which is the whole point.)*
+![moe info](assets/info.gif)
 
 ## Why another engine
 
@@ -153,16 +135,16 @@ grouped-query **or** latent attention, SwiGLU experts with top-k routing.
 
 | Family | What it needs | Status |
 | --- | --- | --- |
-| Mixtral | GQA, softmax routing, per-expert or fused weights | verified on a checkpoint |
-| Qwen2-MoE / Qwen3-MoE | qk-norm, shared expert with its own gate | expected — same tensors, untested |
-| OLMoE | GQA, qk-norm, unnormalised top-k | expected — same tensors, untested |
+| OLMoE | GQA, whole-projection qk-norm, unnormalised top-k | run end to end on the real 7B checkpoint — the demos above |
+| Mixtral | GQA, softmax routing, per-expert or fused weights | loads, packs and generates on a random-weight checkpoint in that format |
+| Qwen2-MoE / Qwen3-MoE | per-head qk-norm, shared expert with its own gate | expected — same tensors, untested |
 | DeepSeek-V2 / V3 | latent attention, sigmoid gate, group-limited routing, shared experts, dense prefix | mechanisms covered by tests, no checkpoint run |
-| Dense Llama-style | no experts at all | works, it is the same path minus routing |
+| Dense Llama-style | no experts at all | works, the same path minus routing |
 
-"Verified" and "expected" mean exactly what they say: see
-[Validation](#validation) for what was actually run. Anything in this family that
-uses standard Hugging Face tensor names should load; if it does not, `moe info`
-reports the first tensor it could not find, which is usually the whole diagnosis.
+Those statuses mean exactly what they say: see [Validation](#validation) for what
+was actually run. Anything in this family that uses standard Hugging Face tensor
+names should load; if it does not, `moe info` reports the first tensor it could
+not find, which is usually the whole diagnosis.
 
 Not supported today: MXFP4 checkpoints, attention sinks and sliding-window
 attention (so GPT-OSS will not load), YaRN and other non-linear rope scaling, NFC
@@ -185,9 +167,17 @@ independently of this one.
   model must keep both its logits (within the format's resolution) and its
   argmax.
 - **Tokenizer.** `scripts/tokcheck.py` compares `moe tokenize` against Hugging
-  Face's `tokenizers` on 326 cases — awkward fixed ones plus generated whitespace,
-  digit, code and mixed-script strings. Both families currently match exactly:
-  326/326 on a byte-level BPE vocabulary and 326/326 on a metaspace one.
+  Face's `tokenizers`, in both directions, on awkward fixed cases plus generated
+  whitespace, digit, code and mixed-script strings. All three vocabularies tried
+  match exactly, encode and decode: 226/226 each on OLMoE's and Qwen's byte-level
+  BPE and on a metaspace one.
+- **A real model.** OLMoE-1B-7B runs end to end — the recordings above are that
+  model, unedited. Four bugs that only a trained checkpoint and a two-way
+  tokenizer check could expose came out of it, each now covered by a test: qk-norm
+  applied per head where OLMoE norms the whole projection; added tokens decoded
+  through the byte-level map, turning its indentation into `????`; added tokens
+  matched by length rather than position; and a metaspace decoder's leading-space
+  strip left unimplemented.
 
 ```console
 $ cargo test                                       # 21 tests, no downloads

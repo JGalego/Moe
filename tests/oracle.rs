@@ -103,6 +103,13 @@ fn mla_incremental_matches_reference() {
     check_incremental("mla");
 }
 
+/// qk-norm has two conventions and only the weight's width distinguishes them.
+#[test]
+fn qk_norm_across_the_whole_projection_matches_reference() {
+    check_incremental("gqa_fullnorm");
+    check_batched("gqa_fullnorm");
+}
+
 #[test]
 fn gqa_batched_prefill_matches_reference() {
     check_batched("gqa");
@@ -130,6 +137,7 @@ fn architecture_is_detected_from_the_checkpoint() {
     let gqa = load(&fixture("gqa").dir);
     assert!(gqa.spec.mla.is_none());
     assert!(gqa.spec.qk_norm);
+    assert!(load(&fixture("gqa_fullnorm").dir).spec.qk_norm);
     assert_eq!((gqa.spec.heads, gqa.spec.kv_heads, gqa.spec.head_dim), (4, 2, 8));
     assert_eq!((gqa.spec.experts, gqa.spec.top_k), (4, 2));
     assert!(!gqa.spec.sigmoid);
