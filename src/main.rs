@@ -39,6 +39,7 @@ RUN OPTIONS
       --warm GB             fault in this many GB of weights before decoding
       --no-stream           print only the finished text
       --stats               per-run routing and throughput detail
+      --trace PATH          write every routing decision as JSONL
 
 PACK OPTIONS
   -o, --out PATH            output file                   [./<name>.moe]
@@ -278,6 +279,9 @@ fn run(args: &Args, path: &Path) {
     let ctx =
         args.get("ctx").and_then(|v| v.parse().ok()).unwrap_or_else(|| m.spec.max_ctx.min(4096)).max(ids.len() + n_gen);
     let mut st = State::new(&m, ctx);
+    if args.get("trace").is_some() {
+        st.trace();
+    }
     let load_s = t_load.elapsed().as_secs_f32();
 
     let warm: f64 = args.num("warm", 0.0);
@@ -350,6 +354,12 @@ fn run(args: &Args, path: &Path) {
         out.len() as f32 / decode_s.max(1e-6),
         rss_note(" | "),
     );
+    if let Some(path) = args.get("trace") {
+        match write_trace(path, &m, &st, tok.as_ref()) {
+            Ok(n) => eprintln!("wrote {n} routing records to {path}"),
+            Err(e) => eprintln!("moe: {path}: {e}"),
+        }
+    }
     if args.on("stats") {
         eprintln!(
             "experts activated {} | repeated previous token's choice {:.0}% | expert bytes touched {} | kv cache {}",
@@ -383,6 +393,36 @@ fn tokenize(args: &Args, path: &Path) {
             eprintln!("{id:>7}  {:?}", tok.decode_one(*id));
         }
     }
+}
+
+/// One JSON object per (token, routed layer): which experts it chose and with
+/// what weight. Flat rather than nested so it streams and greps.
+fn write_trace(path: &str, m: &Model, st: &State, tok: Option<&Tokenizer>) -> std::io::Result<usize> {
+    let Some(tr) = st.trace.as_ref() else { return Ok(0) };
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    // A header line first, so the file explains itself without the model.
+    writeln!(
+        f,
+        "{}",
+        serde_json::json!({
+            "model": m.spec.arch,
+            "layers": m.spec.layers,
+            "experts": m.spec.experts,
+            "top_k": m.spec.top_k,
+        })
+    )?;
+    for r in &tr.routes {
+        let id = tr.tokens.get(r.pos as usize).copied();
+        let line = serde_json::json!({
+            "pos": r.pos,
+            "layer": r.layer,
+            "token": id,
+            "text": id.and_then(|i| tok.map(|k| k.decode_one(i))),
+            "experts": r.experts.iter().map(|(e, w)| serde_json::json!([e, w])).collect::<Vec<_>>(),
+        });
+        writeln!(f, "{line}")?;
+    }
+    Ok(tr.routes.len())
 }
 
 fn bench(args: &Args, path: &Path) {

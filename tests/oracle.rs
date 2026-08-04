@@ -132,6 +132,35 @@ fn packed_q8_preserves_prediction() {
     check_packed("mla", Dt::Q8, 0.25);
 }
 
+/// Tracing must record one entry per token per *routed* layer, with exactly
+/// top-k experts each. The latent fixture has a dense first layer, which is how
+/// we check dense layers contribute nothing.
+#[test]
+fn tracing_records_every_routing_decision() {
+    for (name, routed_layers) in [("gqa", 2), ("mla", 1)] {
+        let f = fixture(name);
+        let m = load(&f.dir);
+        let mut st = State::new(&m, 32);
+        st.trace();
+        m.forward(&f.tokens, &mut st);
+
+        let tr = st.trace.as_ref().expect("tracing was switched on");
+        assert_eq!(tr.tokens, f.tokens, "{name}: token ids not recorded");
+        assert_eq!(tr.routes.len(), f.tokens.len() * routed_layers, "{name}: wrong record count");
+        for r in &tr.routes {
+            assert_eq!(r.experts.len(), m.spec.top_k, "{name}: not top-k experts");
+            assert!(r.experts.iter().all(|(e, _)| (*e as usize) < m.spec.experts), "{name}: expert out of range");
+            assert!((r.pos as usize) < f.tokens.len(), "{name}: position out of range");
+        }
+        // Weights come out strongest first, normalised, then scaled by the
+        // checkpoint's routed_scaling_factor — 1.5 for the latent fixture.
+        let w: Vec<f32> = tr.routes[0].experts.iter().map(|(_, w)| *w).collect();
+        assert!(w.windows(2).all(|p| p[0] >= p[1]), "{name}: weights not ordered");
+        let sum = w.iter().sum::<f32>();
+        assert!((sum - m.spec.routed_scale).abs() < 1e-4, "{name}: weights sum to {sum}, not the routed scale");
+    }
+}
+
 #[test]
 fn architecture_is_detected_from_the_checkpoint() {
     let gqa = load(&fixture("gqa").dir);

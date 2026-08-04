@@ -81,6 +81,24 @@ struct Layer {
     ffn: Ffn,
 }
 
+/// One layer's routing decision for one token.
+#[derive(Clone, Debug)]
+pub struct Route {
+    pub pos: u32,
+    pub layer: u32,
+    /// Selected experts and the weight each was given, strongest first.
+    pub experts: Vec<(u32, f32)>,
+}
+
+/// Recorded routing, when tracing is switched on. Dense layers contribute
+/// nothing, so a layer missing from `routes` is a layer with no experts.
+#[derive(Default, Debug)]
+pub struct Trace {
+    /// Token id at each position the trace covers.
+    pub tokens: Vec<u32>,
+    pub routes: Vec<Route>,
+}
+
 /// Per-sequence mutable state: the KV cache and running counters.
 pub struct State {
     k: Vec<Vec<f32>>,
@@ -91,6 +109,8 @@ pub struct State {
     pub ctx: usize,
     prev: Vec<Vec<u32>>,
     pub stats: Stats,
+    /// Set by [`State::trace`] to record every routing decision.
+    pub trace: Option<Trace>,
 }
 
 #[derive(Default)]
@@ -126,7 +146,14 @@ impl State {
             ctx,
             prev: vec![Vec::new(); m.spec.layers],
             stats: Stats::default(),
+            trace: None,
         }
+    }
+
+    /// Start recording routing decisions. Off by default: it costs an
+    /// allocation per token per routed layer.
+    pub fn trace(&mut self) {
+        self.trace = Some(Trace::default());
     }
 
     /// Bytes held by the KV cache.
@@ -318,6 +345,10 @@ impl Model {
         let t = tokens.len();
         assert!(t > 0 && st.pos + t <= st.ctx, "context window exhausted");
         let h = s.hidden;
+
+        if let Some(tr) = st.trace.as_mut() {
+            tr.tokens.extend_from_slice(tokens);
+        }
 
         let mut x = vec![0.0f32; t * h];
         for (i, tok) in tokens.iter().enumerate() {
@@ -570,6 +601,14 @@ impl Model {
                             *a += w * b;
                         }
                     }
+                }
+                if let Some(tr) = st.trace.as_mut() {
+                    let base = st.pos;
+                    tr.routes.extend(picks.iter().enumerate().map(|(i, p)| Route {
+                        pos: (base + i) as u32,
+                        layer: li as u32,
+                        experts: p.iter().map(|(e, w)| (*e as u32, *w)).collect(),
+                    }));
                 }
                 st.prev[li] = hits;
                 st.stats.routed.fetch_add(routed, Ordering::Relaxed);

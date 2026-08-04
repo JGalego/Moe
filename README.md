@@ -20,7 +20,7 @@ One binary. Linux, macOS, Windows. No GPU, no BLAS, no Python.
 
 **Better call Moe!** Point it at a Hugging Face repo and it downloads, caches, and
 works out what the model is by reading the weights — no config file, no conversion
-step, no `--model-type`. About 3,100 lines of Rust.
+step, no `--model-type`. About 3,300 lines of Rust.
 
 ![moe run](assets/run.gif)
 
@@ -128,6 +128,28 @@ Generation reads `--prompt`, `--prompt-file` or `--ids` (raw token ids, no
 tokenizer needed). Sampling is greedy by default; `--temp`, `--top-p`, `--top-k`,
 `--repeat-penalty` and `--seed` are there when you want them.
 
+## Seeing the routing
+
+`--trace` records which experts every token chose, and at what weight, as JSONL.
+`scripts/routeviz.py` renders one trace as a heatmap, or two as their difference:
+
+```console
+$ moe run <model> -p "import numpy as np ..."   --trace code.jsonl
+$ moe run <model> -p "The French Revolution ..." --trace prose.jsonl
+$ python3 scripts/routeviz.py code.jsonl prose.jsonl -o routing.svg
+```
+
+![expert routing, code vs prose](assets/routing.svg)
+
+Each cell is one expert in one layer; amber means the code prompt picked it more
+often, teal the prose prompt, grey means neither. The strongly coloured cells are
+the point — this checkpoint really does send code and prose to different experts,
+and it is why a sparse model can be big without being slow. Two prompts of ~190
+tokens is a small sample, so read the extremes, not the mid-tones.
+
+The script also prints the same numbers as text, so the picture is never the only
+way to read the trace.
+
 ## Supported models
 
 The engine handles the sparse-decoder family: RMSNorm, rotary embeddings,
@@ -195,13 +217,13 @@ goes. The short version:
 | File | Lines | Role |
 | --- | --- | --- |
 | `src/quant.rs` | 411 | block formats, dequantise + matmul kernels, AVX2 and NEON |
+| `src/model.rs` | 674 | weight binding, the forward pass, the routing trace |
 | `src/store.rs` | 317 | mmap safetensors and `.moe`, tensor views, packing |
 | `src/spec.rs` | 205 | architecture detection from config + tensor shapes |
-| `src/model.rs` | 629 | weight binding and the forward pass |
-| `src/tokenizer.rs` | 591 | `tokenizer.json` BPE, both pre-tokenizer families |
-| `src/fetch.rs` | 361 | resolving paths, URLs and Hub repos; the download cache |
+| `src/tokenizer.rs` | 690 | `tokenizer.json` BPE, both pre-tokenizer families |
+| `src/fetch.rs` | 364 | resolving paths, URLs and Hub repos; the download cache |
 | `src/sample.rs` | 127 | temperature, top-k, top-p, repetition penalty |
-| `src/main.rs` | 402 | CLI |
+| `src/main.rs` | 460 | CLI |
 
 ## Limitations
 

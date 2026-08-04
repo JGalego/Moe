@@ -217,3 +217,19 @@ whole chunk — is so much faster per token than decode.
 `moe bench` measures both. `moe run --stats` additionally reports how many expert
 activations happened, how many repeated the previous token's choice, and how many
 expert bytes were touched.
+
+## Tracing the routing
+
+`--trace` turns on `State::trace`, and every routed layer appends its `(position,
+layer, [(expert, weight)])` decision as it makes it. The cost is one allocation
+per token per routed layer, so it is off unless asked for.
+
+The CLI writes it as JSONL: a header line naming the model, its layer and expert
+counts and its top-k, then one self-contained object per token per routed layer.
+Dense layers write nothing, so a layer absent from the file is a layer without
+experts. `scripts/routeviz.py` turns one file into a heatmap and two into their
+difference, and prints the same numbers as text.
+
+Weights in the trace are the ones actually applied: after the top-k cut, after
+renormalisation, and after `routed_scaling_factor` — so they sum to that factor
+rather than to 1.
