@@ -161,6 +161,36 @@ fn tracing_records_every_routing_decision() {
     }
 }
 
+/// Rewinding the KV cache and continuing must be indistinguishable from never
+/// having cached at all. This is asserted on logits rather than on sampled
+/// tokens: the fixtures' logits are near enough context-independent that an
+/// argmax cannot tell a stale cache from a correct one.
+#[test]
+fn truncating_the_cache_matches_a_fresh_state() {
+    for name in ["gqa", "mla"] {
+        let m = load(&fixture(name).dir);
+
+        // Diverge: run one sequence, rewind to a prefix, continue elsewhere.
+        let mut warm = State::new(&m, 32);
+        m.forward(&[3, 11, 5, 40, 7, 1], &mut warm);
+        warm.truncate(2);
+        let got = m.forward(&[9, 9], &mut warm);
+        let mut fresh = State::new(&m, 32);
+        let want = m.forward(&[3, 11, 9, 9], &mut fresh);
+        let d = max_abs_diff(&got, &want);
+        assert!(d < 1e-5, "{name}: rewound cache diverged, max |diff| = {d}");
+
+        // Extend: the chat case, where the next turn only adds tokens.
+        let mut warm = State::new(&m, 32);
+        m.forward(&[3, 11], &mut warm);
+        let got = m.forward(&[5, 40], &mut warm);
+        let mut fresh = State::new(&m, 32);
+        let want = m.forward(&[3, 11, 5, 40], &mut fresh);
+        let d = max_abs_diff(&got, &want);
+        assert!(d < 1e-5, "{name}: extended cache diverged, max |diff| = {d}");
+    }
+}
+
 #[test]
 fn architecture_is_detected_from_the_checkpoint() {
     let gqa = load(&fixture("gqa").dir);

@@ -14,6 +14,7 @@ USAGE
   moe info  <model>                  show detected architecture and footprint
   moe bench <model> [options]        measure prefill and decode throughput
   moe tokenize <model> -p TEXT       show token ids (--decode 1,2,3 reverses it)
+  moe serve <model> [options]        OpenAI-compatible HTTP server
 
 <model> is any of:
   ./model.moe                        a packed model file
@@ -40,6 +41,15 @@ RUN OPTIONS
       --no-stream           print only the finished text
       --stats               per-run routing and throughput detail
       --trace PATH          write every routing decision as JSONL
+
+SERVE OPTIONS
+      --port N              listen port                   [8080]
+      --host ADDR           bind address                  [127.0.0.1]
+      --ctx N               context window per session    [4096]
+      --chat-format NAME    chatml | llama3 | mistral     [detected from vocab]
+      --max-queue N         requests allowed to wait before 503     [32]
+      --no-prefix-cache     re-prefill every request instead of reusing the cache
+      --cors                allow browser origins
 
 PACK OPTIONS
   -o, --out PATH            output file                   [./<name>.moe]
@@ -80,7 +90,10 @@ impl Args {
                     k => k,
                 }
                 .to_string();
-                let flag = matches!(key.as_str(), "help" | "no-stream" | "stats" | "version" | "offline");
+                let flag = matches!(
+                    key.as_str(),
+                    "help" | "no-stream" | "stats" | "version" | "offline" | "cors" | "no-prefix-cache"
+                );
                 let val = match inline {
                     Some(v) => v,
                     None if flag => "1".into(),
@@ -150,6 +163,7 @@ fn main() {
         "info" => info(&path),
         "pack" => pack(&args, &path, &spec),
         "tokenize" => tokenize(&args, &path),
+        "serve" => serve(&args, &path, &spec),
         other => fail(format!("unknown command '{other}' (try --help)")),
     }
 }
@@ -369,6 +383,26 @@ fn run(args: &Args, path: &Path) {
             human(st.kv_bytes()),
         );
     }
+}
+
+fn serve(args: &Args, path: &Path, spec: &str) {
+    let m = load(path);
+    let tok = tokenizer_for(args, path, Some(&m.store));
+    let chat = match args.get("chat-format") {
+        Some(name) => Some(
+            moe::ChatFormat::by_name(name)
+                .unwrap_or_else(|| fail(format!("unknown chat format '{name}' (chatml, llama3, mistral)"))),
+        ),
+        None => tok.as_ref().and_then(moe::ChatFormat::detect),
+    };
+    let ctx = args.num("ctx", 4096usize).min(m.spec.max_ctx);
+    let name = spec.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("model").to_string();
+    let mut server = moe::Server::new(m, tok, chat, name, ctx, !args.on("no-prefix-cache"));
+    server.cors = args.on("cors");
+    server.max_queue = args.num("max-queue", 32usize).max(1);
+    let host = args.get("host").unwrap_or("127.0.0.1").to_string();
+    let port = args.num("port", 8080u16);
+    moe::serve::run(server, &host, port).unwrap_or_else(|e| fail(format!("{host}:{port}: {e}")));
 }
 
 fn tokenize(args: &Args, path: &Path) {

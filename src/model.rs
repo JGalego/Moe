@@ -162,8 +162,22 @@ impl State {
     }
 
     pub fn reset(&mut self) {
-        self.pos = 0;
+        self.truncate(0);
+    }
+
+    /// Drop everything cached at or after position `n`, keeping the prefix.
+    ///
+    /// The KV cache is append-only per position, so later positions are simply
+    /// overwritten by whatever is forwarded next; nothing needs clearing. The
+    /// per-layer previous-selection does get cleared, because the token that
+    /// produced it is no longer the one before the cursor.
+    pub fn truncate(&mut self, n: usize) {
+        self.pos = n.min(self.pos);
         self.prev.iter_mut().for_each(|p| p.clear());
+        if let Some(tr) = self.trace.as_mut() {
+            tr.tokens.truncate(self.pos);
+            tr.routes.retain(|r| (r.pos as usize) < self.pos);
+        }
     }
 }
 

@@ -3,8 +3,10 @@
 Each module owns one stage of getting from a model spec to a token.
 
 ```
-main.rs      CLI: run, pull, pack, info, bench, tokenize
+main.rs      CLI: run, serve, pull, pack, info, bench, tokenize
   fetch.rs   where the model comes from -> paths, URLs, Hub repos, the cache
+  serve.rs   the OpenAI API              -> sessions, prefix reuse, chat formats
+  http.rs    the socket                  -> a bounded HTTP/1.1 server with SSE
   store.rs   where weights live         -> mmap safetensors / .moe, tensor views
   spec.rs    what the model is          -> shape detection from config + tensors
   model.rs   the forward pass           -> attention, routing, experts
@@ -217,6 +219,40 @@ whole chunk — is so much faster per token than decode.
 `moe bench` measures both. `moe run --stats` additionally reports how many expert
 activations happened, how many repeated the previous token's choice, and how many
 expert bytes were touched.
+
+## Serving
+
+`moe serve` puts one `State` behind a mutex and lets connections queue on it.
+That is not a placeholder for batching: at batch size one the engine is
+memory-bandwidth-bound and rayon already has every core, so a second concurrent
+generation would take throughput from the first rather than add any. Real
+concurrency needs continuous batching — shared prefill, per-sequence KV pools, a
+scheduler — which is a different engine.
+
+Keeping one session is what buys the prefix cache. The session remembers the
+token ids that produced its cache; a new request finds the longest common prefix
+with them, calls `State::truncate` to move the cursor back to it, and prefills
+only the remainder. Conversations grow by appending, so each turn prefills the
+message that was added rather than the whole transcript.
+
+Truncation is cheap because the KV cache is append-only per position: nothing
+needs clearing, since whatever is forwarded next overwrites it. What does get
+cleared is the per-layer previous-selection used for the reuse statistic,
+because the token before the cursor has changed.
+
+A wrong cache hit would produce *silently wrong* output rather than an error, so
+the comparison is on exact token ids rather than a hash, `--no-prefix-cache`
+turns it off, and `truncating_the_cache_matches_a_fresh_state` asserts that
+rewinding and continuing gives the same logits as never having cached. That
+assertion is on logits deliberately: the difference a stale cache makes is around
+1e-3, which changes no argmax on the fixtures and would sail past any test that
+compared generated tokens.
+
+Chat formats are recognised the way everything else is — by what the checkpoint
+contains. A vocabulary with `<|im_start|>` is chatml, `<|start_header_id|>` is
+llama3, `[/INST]` is mistral. Rather than interpret a Jinja template, each format
+is a per-role prefix and suffix plus the opening of the assistant's turn. A
+checkpoint matching none of them gets an error, not a guess.
 
 ## Tracing the routing
 

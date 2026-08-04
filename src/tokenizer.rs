@@ -219,6 +219,12 @@ impl Tokenizer {
         self.tokens.len()
     }
 
+    /// Whether the vocabulary carries this exact token, which is how chat
+    /// formats are recognised without interpreting a template.
+    pub fn has_token(&self, text: &str) -> bool {
+        self.vocab.contains_key(text)
+    }
+
     pub fn is_special(&self, id: u32) -> bool {
         self.special.get(id as usize).copied().unwrap_or(false)
     }

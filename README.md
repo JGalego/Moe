@@ -20,7 +20,7 @@ One binary. Linux, macOS, Windows. No GPU, no BLAS, no Python.
 
 **Better call Moe!** Point it at a Hugging Face repo and it downloads, caches, and
 works out what the model is by reading the weights — no config file, no conversion
-step, no `--model-type`. About 3,300 lines of Rust.
+step, no `--model-type`. About 4,000 lines of Rust.
 
 ![moe run](assets/run.gif)
 
@@ -120,6 +120,7 @@ Other commands:
 $ moe pull  <model>                    # download into the cache, print the path
 $ moe info  <model>                    # architecture, footprint, kv cache size
 $ moe bench <model> -n 64              # prefill and decode throughput
+$ moe serve <model> --port 8080        # OpenAI-compatible HTTP server
 $ moe tokenize <model> -p "hello"      # token ids, for debugging
 $ moe --help                           # every flag
 ```
@@ -127,6 +128,41 @@ $ moe --help                           # every flag
 Generation reads `--prompt`, `--prompt-file` or `--ids` (raw token ids, no
 tokenizer needed). Sampling is greedy by default; `--temp`, `--top-p`, `--top-k`,
 `--repeat-penalty` and `--seed` are there when you want them.
+
+## Serving
+
+```console
+$ moe serve allenai/OLMoE-1B-7B-0924 --port 8080
+$ curl localhost:8080/v1/completions -H 'content-type: application/json' \
+    -d '{"prompt":"The capital of France is","max_tokens":8}'
+```
+
+`/v1/chat/completions`, `/v1/completions` (both with `"stream": true`),
+`/v1/models` and `/health` — enough of the OpenAI API that existing clients work
+without knowing what they are talking to. `prompt` also accepts an array of token
+ids, so a client with no tokenizer can still drive the model.
+
+**It serves one request at a time, on purpose.** At batch size one the engine is
+memory-bandwidth-bound and already uses every core, so concurrent generations
+would halve each other's throughput rather than add any. Requests queue on a
+single session; past `--max-queue` they get a 503 instead of piling up.
+
+That single session is also what makes it quick: it keeps its KV cache between
+requests, so a prompt that extends the last one only prefills what was added.
+Measured on OLMoE with a 125-token prompt, second turn: **1.1s with the cache
+against 5.2s without**, and the gap widens as a conversation grows. `--no-prefix-cache`
+turns it off.
+
+Chat needs a prompt format, and the one a checkpoint wants is inferred from the
+control tokens in its vocabulary — `<|im_start|>` means chatml, `<|start_header_id|>`
+llama3, `[/INST]` mistral. A checkpoint with none of them is a base model, and
+`/v1/chat/completions` refuses rather than guess: a wrong template degrades output
+invisibly, which is worse than an error. `--chat-format` overrides the guess, and
+`/v1/completions` never needs one.
+
+Not implemented, and unlikely to be soon: concurrent generation or batching,
+auth, TLS (so it binds `127.0.0.1` by default), tools and function calling, JSON
+mode, logprobs, embeddings.
 
 ## Seeing the routing
 
@@ -217,13 +253,15 @@ goes. The short version:
 | File | Lines | Role |
 | --- | --- | --- |
 | `src/quant.rs` | 411 | block formats, dequantise + matmul kernels, AVX2 and NEON |
-| `src/model.rs` | 674 | weight binding, the forward pass, the routing trace |
+| `src/model.rs` | 688 | weight binding, the forward pass, the routing trace |
 | `src/store.rs` | 317 | mmap safetensors and `.moe`, tensor views, packing |
 | `src/spec.rs` | 205 | architecture detection from config + tensor shapes |
-| `src/tokenizer.rs` | 690 | `tokenizer.json` BPE, both pre-tokenizer families |
+| `src/tokenizer.rs` | 696 | `tokenizer.json` BPE, both pre-tokenizer families |
 | `src/fetch.rs` | 364 | resolving paths, URLs and Hub repos; the download cache |
+| `src/serve.rs` | 455 | the OpenAI API, sessions, prefix reuse, chat formats |
+| `src/http.rs` | 169 | a small bounded HTTP/1.1 server with SSE |
 | `src/sample.rs` | 127 | temperature, top-k, top-p, repetition penalty |
-| `src/main.rs` | 460 | CLI |
+| `src/main.rs` | 492 | CLI |
 
 ## Limitations
 
