@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="moe">
+  <title>moe</title>
+  <desc>Eight expert segments in a ring, two of them lit.</desc>
+  <path d="M66.39 26.07 A38.0 38.0 0 0 1 89.13 35.50" fill="none" stroke="#e0973a" stroke-width="20" stroke-linecap="butt"/>
+  <path d="M92.50 38.87 A38.0 38.0 0 0 1 101.93 61.61" fill="none" stroke="#17b3a3" stroke-width="20" stroke-linecap="butt"/>
+  <path d="M101.93 66.39 A38.0 38.0 0 0 1 92.50 89.13" fill="none" stroke="#e0973a" stroke-width="20" stroke-linecap="butt"/>
+  <path d="M89.13 92.50 A38.0 38.0 0 0 1 66.39 101.93" fill="none" stroke="#e0973a" stroke-width="20" stroke-linecap="butt"/>
+  <path d="M61.61 101.93 A38.0 38.0 0 0 1 38.87 92.50" fill="none" stroke="#e0973a" stroke-width="20" stroke-linecap="butt"/>
+  <path d="M35.50 89.13 A38.0 38.0 0 0 1 26.07 66.39" fill="none" stroke="#17b3a3" stroke-width="20" stroke-linecap="butt"/>
+  <path d="M26.07 61.61 A38.0 38.0 0 0 1 35.50 38.87" fill="none" stroke="#e0973a" stroke-width="20" stroke-linecap="butt"/>
+  <path d="M38.87 35.50 A38.0 38.0 0 0 1 61.61 26.07" fill="none" stroke="#e0973a" stroke-width="20" stroke-linecap="butt"/>
+</svg>

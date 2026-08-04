@@ -1,17 +1,17 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="Moe" width="560">
+<img src="assets/logo.svg" alt="moe" width="360">
 
 ### Every expert on tap.
 
 CPU inference for sparse mixture-of-experts models.<br>
 One binary. Linux, macOS, Windows. No GPU, no BLAS, no Python.
 
-[![ci](https://img.shields.io/github/actions/workflow/status/JGalego/Moe/ci.yml?branch=main&style=flat-square&label=ci&color=3ee0d0)](https://github.com/JGalego/Moe/actions/workflows/ci.yml)
-[![release](https://img.shields.io/github/v/release/JGalego/Moe?style=flat-square&color=ffb02e&label=release)](https://github.com/JGalego/Moe/releases/latest)
+[![ci](https://img.shields.io/github/actions/workflow/status/JGalego/Moe/ci.yml?branch=main&style=flat-square&label=ci&color=17b3a3)](https://github.com/JGalego/Moe/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/JGalego/Moe?style=flat-square&color=e0973a&label=release)](https://github.com/JGalego/Moe/releases/latest)
 [![platforms](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-8b95a6?style=flat-square)](#install)
-[![rust](https://img.shields.io/badge/rust-1.75%2B-ffb02e?style=flat-square)](https://www.rust-lang.org)
-[![gpu](https://img.shields.io/badge/GPU-not%20required-3ee0d0?style=flat-square)](#why-another-engine)
+[![rust](https://img.shields.io/badge/rust-1.75%2B-e0973a?style=flat-square)](https://www.rust-lang.org)
+[![gpu](https://img.shields.io/badge/GPU-not%20required-17b3a3?style=flat-square)](#why-another-engine)
 [![license](https://img.shields.io/badge/license-MIT-8b95a6?style=flat-square)](LICENSE)
 
 </div>

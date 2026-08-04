@@ -35,14 +35,21 @@ pub use store::Store;
 pub use tokenizer::Tokenizer;
 
 /// Peak resident set size in bytes, or 0 where the OS does not report it.
+#[cfg(unix)]
 pub fn peak_rss() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines().find(|l| l.starts_with("VmHWM:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
-        })
-        .map(|kb| kb * 1024)
-        .unwrap_or(0)
+    // ru_maxrss is kilobytes on Linux and bytes on the BSDs, macOS included.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return 0;
+    }
+    let scale = if cfg!(target_os = "linux") { 1024 } else { 1 };
+    (usage.ru_maxrss as u64).saturating_mul(scale)
+}
+
+/// Peak resident set size in bytes, or 0 where the OS does not report it.
+#[cfg(not(unix))]
+pub fn peak_rss() -> u64 {
+    0
 }
 
 /// Human-readable byte count.
