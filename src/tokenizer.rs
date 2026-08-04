@@ -1,6 +1,6 @@
 //! A small BPE tokenizer that reads Hugging Face `tokenizer.json` directly.
 //!
-//! Covers the two pre-tokenizers these checkpoints actually ship: byte-level
+//! Covers the pre-tokenizers these checkpoints actually ship: byte-level
 //! (GPT-2 style) and metaspace (sentencepiece-style). Added and special tokens
 //! are matched before anything else, so chat control tokens survive.
 

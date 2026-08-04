@@ -116,8 +116,9 @@ running anything. From a repo, only the files inference reads are downloaded:
 demos and conversions that repos accumulate. A repo publishing a packed `.moe`
 yields just that one file instead.
 
-Then pack it, if you like. Packing re-quantises every weight, drops tensors inference
-never reads, and embeds `tokenizer.json`, giving one self-contained file:
+Then pack it, if you like. Packing re-quantises every weight, drops tensors
+inference never reads, and embeds `tokenizer.json`, giving one self-contained
+file:
 
 ```console
 $ moe pack mistralai/Mixtral-8x7B-v0.1 --quant q8 --expert-quant q4
@@ -175,7 +176,7 @@ independently of this one.
 
 - **Forward pass.** `scripts/oracle.py` builds tiny random checkpoints and runs a
   reference forward pass in pure Python, written from the model definitions
-  rather than from this code. Two fixtures cover the interesting mechanisms:
+  rather than from this code. The fixtures cover the interesting mechanisms:
   grouped-query attention with qk-norm and softmax routing, and latent attention
   with sigmoid gating, group-limited routing, a shared expert and a dense first
   layer. The engine has to reproduce the reference logits at every position,

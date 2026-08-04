@@ -1,6 +1,6 @@
 # How Moe works
 
-Seven files, one binary.
+Each module owns one stage of getting from a model spec to a token.
 
 ```
 main.rs      CLI: run, pull, pack, info, bench, tokenize
@@ -73,7 +73,7 @@ convenient, and to fold the tokenizer in.
 
 ## Quantisation and kernels
 
-Five storage formats: `F32`, `F16`, `BF16`, and two block formats.
+Weights are stored as `F32`, `F16`, `BF16`, or block-quantised:
 
 | Format | Layout per 32 values | Bits/weight |
 | --- | --- | --- |
@@ -94,12 +94,12 @@ for each row r (in parallel bands):
     for each token t:  out[t][r] = dot(buf, x[t])
 ```
 
-Three consequences follow. Adding a format means adding a `dequant` arm, not a
-kernel. The dequantisation cost is amortised across the batch, so prefill reads
-each weight once instead of once per token. And there is exactly one hot loop to
-optimise — `dot` — which has hand-written AVX2/FMA (detected at runtime) and NEON
-paths, plus a scalar fallback shaped to autovectorise. The scratch buffer is
-`cols` f32, which stays in L1 for realistic hidden sizes.
+Adding a format means adding a `dequant` arm, not a kernel. The dequantisation
+cost is amortised across the batch, so prefill reads each weight once instead of
+once per token. And there is exactly one hot loop to optimise — `dot` — which has
+hand-written AVX2/FMA (detected at runtime) and NEON paths, plus a scalar
+fallback shaped to autovectorise. The scratch buffer is `cols` f32, which stays
+in L1 for realistic hidden sizes.
 
 Rows are split into bands across the rayon pool; results accumulate row-major and
 are transposed once at the end, an `O(rows * t)` shuffle next to `O(rows * cols *
@@ -140,8 +140,8 @@ Per layer: RMSNorm, attention, residual, RMSNorm, feed-forward, residual.
 
 ### Attention
 
-Two front-ends produce the same three things — per-head queries, keys and values
-— after which the causal softmax attention is shared.
+Both front-ends produce the same thing — per-head queries, keys and values —
+after which the causal softmax attention is shared.
 
 **Grouped-query.** `q`, `k`, `v` projections, optional biases, optional per-head
 qk-norm, then rotary embedding. Keys and values are appended to the cache. Query
