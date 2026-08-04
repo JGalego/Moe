@@ -34,4 +34,4 @@ First release.
 ### Platforms
 
 Linux, macOS and Windows, x86-64 and arm64. Prebuilt binaries, an install script
-for each platform, or `cargo install ontap`.
+for each platform, or `cargo install moe-ontap`.

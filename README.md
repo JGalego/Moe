@@ -68,7 +68,7 @@ $ curl -fsSL https://raw.githubusercontent.com/JGalego/Moe/main/install.sh | sh
 Or from source, with a Rust toolchain (1.85+):
 
 ```console
-$ cargo install ontap                                  # the crate is `ontap`, the binary `moe`
+$ cargo install moe-ontap                              # the crate is `moe-ontap`, the binary `moe`
 $ cargo install --git https://github.com/JGalego/Moe    # or straight from source
 $ cargo test                                            # full suite, no downloads, ~2s
 ```
