@@ -56,14 +56,28 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      # Before download-artifact: checkout cleans the workspace, which would
+      # take the artifacts with it.
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
       - name: checksums
         run: cd dist && sha256sum *.tar.gz > SHA256SUMS
+      # The section the tag names, so the release reads as what was written for
+      # it rather than as a list of commits. A tag with no section leaves this
+      # empty and the generated notes stand alone.
+      - name: notes
+        run: |
+          awk -v v="${GITHUB_REF_NAME#v}" '
+            $0 == "## " v { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
       - uses: softprops/action-gh-release@v2
         with:
+          body_path: notes.md
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS
