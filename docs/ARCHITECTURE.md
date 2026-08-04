@@ -1,6 +1,6 @@
 # How Moe works
 
-Seven files, one binary. This is the tour.
+Seven files, one binary.
 
 ```
 main.rs      CLI: run, pull, pack, info, bench, tokenize
@@ -94,7 +94,7 @@ for each row r (in parallel bands):
     for each token t:  out[t][r] = dot(buf, x[t])
 ```
 
-That has three consequences. Adding a format means adding a `dequant` arm, not a
+Three consequences follow. Adding a format means adding a `dequant` arm, not a
 kernel. The dequantisation cost is amortised across the batch, so prefill reads
 each weight once instead of once per token. And there is exactly one hot loop to
 optimise — `dot` — which has hand-written AVX2/FMA (detected at runtime) and NEON
@@ -188,9 +188,9 @@ three, or whole runs, whether newlines bind to symbols, whether contractions are
 case-insensitive — then applies the alternation directly, in order. The result is
 checked against Hugging Face's own tokenizer (see `scripts/tokcheck.py`).
 
-Merging uses a heap over live neighbour pairs, ordered by rank then position.
-That matters because metaspace checkpoints declare no pre-tokenizer at all and
-hand BPE the entire prompt as one word, where the naive quadratic scan would be
+Merging uses a heap over live neighbour pairs, ordered by rank then position,
+which matters because metaspace checkpoints declare no pre-tokenizer at all and
+hand BPE the entire prompt as one word — where a naive quadratic scan would be
 painful.
 
 Decoding works in bytes, not strings, because one character can span several

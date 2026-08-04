@@ -85,8 +85,8 @@ it could not resolve, which is nearly always the answer.
 - **YaRN, NTK and other non-linear rope scaling.** A plain `factor` is applied as
   linear scaling; anything else is ignored, which will hurt beyond the base
   context length.
-- **NFC normalisation** in the tokenizer. Text that is already normalised — which
-  covers essentially everything in practice — is unaffected.
+- **NFC normalisation** in the tokenizer. Already-normalised text — essentially
+  everything in practice — is unaffected.
 - **Encoder-decoder and multimodal models.**
 - **Mamba/SSM and other non-attention blocks**, including hybrid stacks.
 

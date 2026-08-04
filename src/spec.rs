@@ -4,7 +4,7 @@
 //! size, vocabulary, expert width, whether attention is latent, whether a layer
 //! is dense or routed. So [`Spec`] reads only the handful of values that cannot
 //! be recovered from tensor shapes, and everything else is detected from the
-//! weights themselves. That is why new checkpoints usually need no code.
+//! weights themselves, which is why new checkpoints usually need no code.
 
 use crate::store::Store;
 use serde_json::Value;

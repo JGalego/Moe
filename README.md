@@ -26,8 +26,8 @@ step, no `--model-type`. About 3,100 lines of Rust.
 $ moe run mistralai/Mixtral-8x7B-v0.1 -p "A sparse model is one where" -n 64
 ```
 
-That is the whole setup. The weights are fetched once with a progress bar, cached,
-and reused instantly on every run after that.
+The weights are fetched once with a progress bar, cached, and reused instantly on
+every run after that.
 
 ```console
 $ moe info ~/models/mixtral
@@ -44,9 +44,8 @@ kv cache   256.00 MB per 1k tokens
 source     /home/you/models/mixtral (safetensors)
 ```
 
-*(That is the layout `moe info` prints. The figures are computed from
-Mixtral-8x7B's published shapes rather than measured on a run — 97% of the
-checkpoint is expert weights, which is the whole point.)*
+*(Figures computed from Mixtral-8x7B's published shapes rather than measured on a
+run — 97% of the checkpoint is expert weights, which is the whole point.)*
 
 ## Why another engine
 
@@ -114,8 +113,8 @@ elsewhere — and reused after that. `MOE_CACHE` moves it, `HF_TOKEN` reaches ga
 repos, `--offline` refuses to download, and `moe pull <model>` fetches without
 running anything. From a repo, only the files inference reads are downloaded:
 `config.json`, `tokenizer.json` and the weights, skipping the `.bin` duplicates,
-demos and conversions that repos accumulate. If the repo publishes a packed
-`.moe`, that is taken on its own instead.
+demos and conversions that repos accumulate. A repo publishing a packed `.moe`
+yields just that one file instead.
 
 Then pack it, if you like. Packing re-quantises every weight, drops tensors inference
 never reads, and embeds `tokenizer.json`, giving one self-contained file:
