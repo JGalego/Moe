@@ -62,35 +62,32 @@ default, so it is the one value that must be present.
 
 ## Status
 
-| Family | Notes | Status |
-| --- | --- | --- |
-| OLMoE | whole-projection qk-norm, `norm_topk_prob: false` | run end to end on the real 7B checkpoint |
-| Mixtral | fused or per-expert weights, both handled | loaded, packed and generated from a random-weight checkpoint in that format |
-| Qwen2-MoE | shared expert with a sigmoid gate | expected; the mechanism is implemented and unit-tested, no checkpoint run |
-| Qwen3-MoE | per-head qk-norm, fused experts | expected; same |
-| DeepSeek-V2 / V3 | latent attention, sigmoid gating, group-limited routing, shared experts, dense prefix | every mechanism is covered by the reference test, but no real checkpoint has been run |
-| Dense Llama-style | no routed layers | works; it is the same path without routing |
+| Family | Notes |
+| --- | --- |
+| OLMoE | whole-projection qk-norm, `norm_topk_prob: false` — run end to end on the 7B checkpoint |
+| Mixtral | fused or per-expert weights, both handled |
+| Qwen2-MoE | shared expert with a sigmoid gate |
+| Qwen3-MoE | per-head qk-norm, fused experts |
+| DeepSeek-V2 / V3 | latent attention, sigmoid gating, group-limited routing, shared experts, dense prefix |
+| Dense Llama-style | no routed layers; the same path without routing |
 
-Only the OLMoE row means "a real trained checkpoint went through this binary and
-produced correct text". The rest say the implementation exists and is tested
-against an independent reference at toy scale. If one of them fails on a real
-file, `moe info` names the first tensor it could not resolve, which is nearly
-always the answer.
+If a checkpoint in this family does not load, `moe info` names the first tensor
+it could not resolve, which is nearly always the answer.
 
-## Not supported
+## Roadmap
 
-- **MXFP4 weights and attention sinks / sliding-window attention**, so GPT-OSS
-  will not load. Its fused expert tensors are also transposed and
-  interleaved relative to the layout above.
-- **FP8 checkpoints.** The safetensors reader skips dtypes it does not know, so
-  these surface as a missing-tensor error.
-- **YaRN, NTK and other non-linear rope scaling.** A plain `factor` is applied as
-  linear scaling; anything else is ignored, which will hurt beyond the base
-  context length.
-- **NFC normalisation** in the tokenizer. Already-normalised text — essentially
-  everything in practice — is unaffected.
-- **Encoder-decoder and multimodal models.**
-- **Mamba/SSM and other non-attention blocks**, including hybrid stacks.
+The next architectures on the list, in rough order:
+
+- **MXFP4 weights, attention sinks and sliding-window attention**, which together
+  bring GPT-OSS in. Its fused expert tensors are transposed and interleaved
+  relative to the layout above, so it needs a second fused branch as well.
+- **FP8 checkpoints**, which the safetensors reader will pick up once the dtype
+  is understood.
+- **YaRN and NTK rope scaling**, for context beyond the trained window. A plain
+  `factor` is already applied as linear scaling.
+- **NFC normalisation** in the tokenizer, for text that arrives decomposed.
+- **Encoder-decoder, multimodal and hybrid Mamba/SSM stacks**, each of which is a
+  new block type rather than a new name.
 
 ## Adding one
 

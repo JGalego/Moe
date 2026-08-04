@@ -1,5 +1,7 @@
 [package]
-name = "moe"
+# The binary and the library are both `moe`; the registry slug is `ontap`
+# because `moe` was already taken. "Every expert on tap."
+name = "ontap"
 version = "0.1.0"
 edition = "2021"
 # 1.85 is the floor its dependencies impose, not a preference: ureq requires

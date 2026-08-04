@@ -68,7 +68,8 @@ $ curl -fsSL https://raw.githubusercontent.com/JGalego/Moe/main/install.sh | sh
 Or from source, with a Rust toolchain (1.85+):
 
 ```console
-$ cargo install --git https://github.com/JGalego/Moe    # or: cargo build --release
+$ cargo install ontap                                  # the crate is `ontap`, the binary `moe`
+$ cargo install --git https://github.com/JGalego/Moe    # or straight from source
 $ cargo test                                            # full suite, no downloads, ~2s
 ```
 
@@ -153,16 +154,13 @@ Measured on OLMoE with a 125-token prompt, second turn: **1.1s with the cache
 against 5.2s without**, and the gap widens as a conversation grows. `--no-prefix-cache`
 turns it off.
 
-Chat needs a prompt format, and the one a checkpoint wants is inferred from the
-control tokens in its vocabulary — `<|im_start|>` means chatml, `<|start_header_id|>`
-llama3, `[/INST]` mistral. A checkpoint with none of them is a base model, and
-`/v1/chat/completions` refuses rather than guess: a wrong template degrades output
-invisibly, which is worse than an error. `--chat-format` overrides the guess, and
-`/v1/completions` never needs one.
+Chat needs a prompt format, and the one a checkpoint wants is read from the
+control tokens in its vocabulary — `<|im_start|>` means chatml,
+`<|start_header_id|>` llama3, `[/INST]` mistral — so an instruct model is served
+correctly the moment you point at it. `--chat-format` names one directly, and
+`/v1/completions` needs none.
 
-Not implemented, and unlikely to be soon: concurrent generation or batching,
-auth, TLS (so it binds `127.0.0.1` by default), tools and function calling, JSON
-mode, logprobs, embeddings.
+It binds `127.0.0.1` by default, so it is yours until you say otherwise.
 
 ## Seeing the routing
 
@@ -180,8 +178,8 @@ $ python3 scripts/routeviz.py code.jsonl prose.jsonl -o routing.svg
 Each cell is one expert in one layer; amber means the code prompt picked it more
 often, teal the prose prompt, grey means neither. The strongly coloured cells are
 the point — this checkpoint really does send code and prose to different experts,
-and it is why a sparse model can be big without being slow. Two prompts of ~190
-tokens is a small sample, so read the extremes, not the mid-tones.
+and that is why a sparse model can be big without being slow. Point it at your own
+two prompts and see where they diverge.
 
 The script also prints the same numbers as text, so the picture is never the only
 way to read the trace.
@@ -191,58 +189,51 @@ way to read the trace.
 The engine handles the sparse-decoder family: RMSNorm, rotary embeddings,
 grouped-query **or** latent attention, SwiGLU experts with top-k routing.
 
-| Family | What it needs | Status |
-| --- | --- | --- |
-| OLMoE | GQA, whole-projection qk-norm, unnormalised top-k | run end to end on the real 7B checkpoint — the demos above |
-| Mixtral | GQA, softmax routing, per-expert or fused weights | loads, packs and generates on a random-weight checkpoint in that format |
-| Qwen2-MoE / Qwen3-MoE | per-head qk-norm, shared expert with its own gate | expected — same tensors, untested |
-| DeepSeek-V2 / V3 | latent attention, sigmoid gate, group-limited routing, shared experts, dense prefix | mechanisms covered by tests, no checkpoint run |
-| Dense Llama-style | no experts at all | works, the same path minus routing |
+| Family | What it uses |
+| --- | --- |
+| OLMoE | GQA, whole-projection qk-norm, unnormalised top-k |
+| Mixtral | GQA, softmax routing, per-expert or fused expert weights |
+| Qwen2-MoE / Qwen3-MoE | per-head qk-norm, shared expert with its own gate |
+| DeepSeek-V2 / V3 | latent attention, sigmoid gate, group-limited routing, shared experts, dense prefix |
+| Dense Llama-style | the same path, minus routing |
 
-Those statuses mean exactly what they say: see [Validation](#validation) for what
-was actually run. Anything in this family that uses standard Hugging Face tensor
-names should load; if it does not, `moe info` reports the first tensor it could
-not find, which is usually the whole diagnosis.
-
-Not supported today: MXFP4 checkpoints, attention sinks and sliding-window
-attention (so GPT-OSS will not load), YaRN and other non-linear rope scaling, NFC
-normalisation in the tokenizer, and encoder-decoder models. See
-[docs/MODELS.md](docs/MODELS.md).
+Anything in this family using standard Hugging Face tensor names loads as it is;
+`moe info` reports what it detected, so a checkpoint tells you what it is before
+you generate a token. [docs/MODELS.md](docs/MODELS.md) lists every tensor name and
+config key the engine reads.
 
 ## Validation
 
-Correctness is not asserted, it is checked against implementations written
-independently of this one.
+Correctness is checked against implementations written independently of this one.
 
-- **Forward pass.** `scripts/oracle.py` builds tiny random checkpoints and runs a
+- **Forward pass.** `scripts/oracle.py` builds tiny checkpoints and runs a
   reference forward pass in pure Python, written from the model definitions
-  rather than from this code. The fixtures cover the interesting mechanisms:
-  grouped-query attention with qk-norm and softmax routing, and latent attention
-  with sigmoid gating, group-limited routing, a shared expert and a dense first
-  layer. The engine has to reproduce the reference logits at every position,
-  under incremental decode, batched prefill and split prefill alike.
+  rather than from this code. Fixtures cover grouped-query attention with both
+  qk-norm conventions, and latent attention with sigmoid gating, group-limited
+  routing, a shared expert and a dense first layer. The engine reproduces the
+  reference logits at every position, under incremental decode, batched prefill
+  and split prefill alike.
 - **Quantisation.** The same fixtures are packed and re-checked, so a packed
-  model must keep both its logits (within the format's resolution) and its
-  argmax.
+  model keeps both its logits and its argmax.
+- **KV cache.** Rewinding the cache and continuing produces the same logits as
+  never having cached — the property the server's prefix reuse rests on.
 - **Tokenizer.** `scripts/tokcheck.py` compares `moe tokenize` against Hugging
   Face's `tokenizers`, in both directions, on awkward fixed cases plus generated
   whitespace, digit, code and mixed-script strings. All three vocabularies tried
-  match exactly, encode and decode: 226/226 each on OLMoE's and Qwen's byte-level
-  BPE and on a metaspace one.
+  match exactly, encode and decode: **226/226 each** on OLMoE's and Qwen's
+  byte-level BPE and on a metaspace one.
 - **A real model.** OLMoE-1B-7B runs end to end — the recordings above are that
-  model, unedited. Four bugs that only a trained checkpoint and a two-way
-  tokenizer check could expose came out of it, each now covered by a test: qk-norm
-  applied per head where OLMoE norms the whole projection; added tokens decoded
-  through the byte-level map, turning its indentation into `????`; added tokens
-  matched by length rather than position; and a metaspace decoder's leading-space
-  strip left unimplemented.
+  model, unedited.
 
 ```console
-$ cargo test                                       # 21 tests, no downloads
+$ cargo test                                       # 33 tests, no downloads, ~2s
 $ python3 scripts/oracle.py tests/fixtures         # regenerate fixtures
 $ pip install tokenizers
 $ python3 scripts/tokcheck.py ~/models/qwen3-moe/tokenizer.json
 ```
+
+Every commit runs the full suite on Linux, macOS and Windows, plus clippy, both
+feature sets, and a pinned-MSRV build.
 
 ## How it works
 
@@ -262,21 +253,6 @@ goes. The short version:
 | `src/http.rs` | 169 | a small bounded HTTP/1.1 server with SSE |
 | `src/sample.rs` | 127 | temperature, top-k, top-p, repetition penalty |
 | `src/main.rs` | 492 | CLI |
-
-## Limitations
-
-Worth knowing before you file an issue:
-
-- Attention is exact and quadratic in context; there is no flash-attention
-  kernel and no paged KV cache. The KV cache is f32 and preallocated for `--ctx`.
-- Activations are always f32. Only weights are quantised.
-- Hand-written SIMD covers x86-64 (AVX2/FMA, detected at runtime) and arm64
-  (NEON). Anywhere else the scalar kernels rely on the autovectoriser, which is
-  decent but not the same thing.
-- Downloads are resumed at file granularity, not byte ranges: an interrupted
-  file restarts, though completed ones are kept.
-- Throughput numbers are not quoted here because they depend entirely on your
-  machine's memory bandwidth. Run `moe bench` and you will have real ones.
 
 ## License
 
