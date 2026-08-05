@@ -196,13 +196,23 @@ impl Store {
             maps.push(buf);
         }
         let cfg = dir.join("config.json");
-        let config = if cfg.exists() {
+        let mut config = if cfg.exists() {
             let mut s = String::new();
             File::open(&cfg)?.read_to_string(&mut s)?;
             serde_json::from_str(&s).unwrap_or(Value::Null)
         } else {
             Value::Null
         };
+        // The two files disagree on purpose. `config.json` names a
+        // beginning-of-sequence token; `tokenizer_config.json` says whether to
+        // prepend it, and plenty of checkpoints name one they never use. Reading
+        // the id alone prefixes every prompt with a token the model was not
+        // trained to continue from — which generates, just as a different model.
+        if add_bos_in(dir) == Some(false) {
+            if let Some(o) = config.as_object_mut() {
+                o.remove("bos_token_id");
+            }
+        }
         Ok(Store {
             maps,
             index,
@@ -699,6 +709,15 @@ pub fn chat_template_in(dir: &Path) -> Option<String> {
             .and_then(|t| t["template"].as_str().map(String::from)),
         _ => None,
     }
+}
+
+/// Whether `tokenizer_config.json` beside a checkpoint asks for a leading
+/// beginning-of-sequence token. `None` means it does not say, and the caller
+/// keeps whatever `config.json` implies.
+fn add_bos_in(dir: &Path) -> Option<bool> {
+    let raw = std::fs::read(dir.join("tokenizer_config.json")).ok()?;
+    let cfg: Value = serde_json::from_slice(&raw).ok()?;
+    cfg["add_bos_token"].as_bool()
 }
 
 /// Round a byte range out to page boundaries, as the memory syscalls require.

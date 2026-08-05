@@ -718,3 +718,34 @@ fn architecture_is_detected_from_the_checkpoint() {
     // Layer 0 is dense, so only the routed layer contributes expert bytes.
     assert!(mla.expert_bytes() > 0);
 }
+
+/// `config.json` names a beginning-of-sequence token; `tokenizer_config.json`
+/// says whether to use one. Qwen names a token it never prepends, and reading
+/// the id alone puts an `<|endoftext|>` in front of every prompt — which does
+/// not fail, it just answers as a different model would.
+#[test]
+fn a_declared_bos_token_is_dropped_when_the_tokenizer_refuses_it() {
+    let src = fixture("gqa").dir;
+    let dir = std::env::temp_dir().join("moe-test-bos");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in ["model.safetensors", "config.json"] {
+        std::fs::copy(src.join(f), dir.join(f)).unwrap();
+    }
+    let mut cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    cfg["bos_token_id"] = serde_json::json!(3);
+    std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+
+    // With no tokenizer_config.json, the declared id stands.
+    assert_eq!(load(&dir).spec.bos, Some(3));
+
+    // Saying nothing about it also leaves it alone.
+    std::fs::write(dir.join("tokenizer_config.json"), r#"{"model_max_length": 8}"#).unwrap();
+    assert_eq!(load(&dir).spec.bos, Some(3));
+
+    // Refusing it drops it.
+    std::fs::write(dir.join("tokenizer_config.json"), r#"{"add_bos_token": false}"#).unwrap();
+    assert_eq!(load(&dir).spec.bos, None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -356,11 +356,21 @@ impl Gguf {
         // it. Honouring the id but not the flag silently prefixes every prompt
         // with a token the checkpoint did not want — which does not fail, it just
         // scores and generates as a different model would.
-        let add_bos = self.get("tokenizer.ggml.add_bos_token").and_then(|v| match v {
-            Meta::Bool(b) => Some(*b),
-            other => other.as_i64().map(|i| i != 0),
-        });
-        if add_bos != Some(false) {
+        //
+        // Most files omit the flag, so the default decides, and it is not one
+        // value: llama.cpp keys it off the tokenizer model. SentencePiece and
+        // WordPiece checkpoints prepend a beginning-of-sequence token; byte-level
+        // BPE ones — Qwen, GPT-2, OLMo — do not, and giving one a `<|endoftext|>`
+        // to continue from sends it somewhere else entirely.
+        let vocab_kind = self.get("tokenizer.ggml.model").and_then(|v| v.as_str()).unwrap_or("");
+        let add_bos = self
+            .get("tokenizer.ggml.add_bos_token")
+            .and_then(|v| match v {
+                Meta::Bool(b) => Some(*b),
+                other => other.as_i64().map(|i| i != 0),
+            })
+            .unwrap_or(matches!(vocab_kind, "llama" | "bert" | "t5"));
+        if add_bos {
             set(&mut c, "bos_token_id", ids(self, "bos_token_id").map(|v| json!(v)));
         }
         set(&mut c, "eos_token_id", ids(self, "eos_token_id").map(|v| json!(v)));
@@ -781,6 +791,33 @@ mod tests {
         let mut huge_meta = good.clone();
         huge_meta[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(Gguf::parse(&huge_meta).is_err());
+    }
+
+    /// Whether to prepend a beginning-of-sequence token is decided by the
+    /// tokenizer model when the file does not say, exactly as llama.cpp decides
+    /// it. Getting this wrong is not an error: the model simply continues from a
+    /// token it was never trained to see, in whatever language it likes.
+    #[test]
+    fn a_bos_token_is_prepended_only_when_the_checkpoint_wants_one() {
+        let build = |kind: &str, flag: Option<bool>| {
+            let mut b = Builder::new();
+            b.str_kv("general.architecture", "llama")
+                .str_kv("tokenizer.ggml.model", kind)
+                .u32_kv("tokenizer.ggml.bos_token_id", 7);
+            if let Some(f) = flag {
+                b.u32_kv("tokenizer.ggml.add_bos_token", f as u32);
+            }
+            Gguf::parse(&b.build()).unwrap().config()["bos_token_id"].clone()
+        };
+        // Byte-level BPE — Qwen, GPT-2, OLMo — does not, and most files of that
+        // kind omit the flag entirely.
+        assert_eq!(build("gpt2", None), Value::Null);
+        // SentencePiece and WordPiece do.
+        assert_eq!(build("llama", None), 7);
+        assert_eq!(build("bert", None), 7);
+        // An explicit flag decides either way, whatever the vocabulary is.
+        assert_eq!(build("gpt2", Some(true)), 7);
+        assert_eq!(build("llama", Some(false)), Value::Null);
     }
 
     #[test]
