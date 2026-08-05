@@ -32,6 +32,7 @@ gated repos, and --offline to refuse to download.
 RUN OPTIONS
   -p, --prompt TEXT         prompt text
       --prompt-file PATH    read the prompt from a file
+      --prompts PATH        one prompt per line; writes one JSON result per line
       --ids 1,2,3           feed token ids directly (no tokenizer needed)
   -n, --tokens N            tokens to generate            [128]
       --ctx N               context window                [min(model, 4096)]
@@ -108,9 +109,8 @@ EMBED OPTIONS
 
 PACK OPTIONS
   -o, --out PATH            output file                   [./<name>.moe]
-      --quant FMT           dense weights                 [q8]
-      --expert-quant FMT    routed experts                [--quant]
-      --quant FMT/--expert-quant FMT take q4 q5 q6 q8 f16 f32
+      --quant FMT           dense weights: q4 q5 q6 q8 f16 f32          [q8]
+      --expert-quant FMT    routed experts                          [--quant]
       --keep-experts TRACE  prune to the experts this trace used, per layer
       --keep N              how many to keep per layer    [top_k x 2]
       --hot-experts TRACE    store the experts this trace leans on more finely
@@ -466,6 +466,25 @@ fn pin(args: &Args, m: &Model) {
     );
 }
 
+/// The sampler and speculation settings a run asked for. Shared so `--prompts`
+/// and a single prompt cannot drift.
+fn plan_of(args: &Args) -> moe::Plan {
+    moe::Plan {
+        max_tokens: args.num("tokens", 128usize),
+        sampler: Sampler {
+            temp: args.num("temp", 0.0),
+            top_p: args.num("top-p", 0.95),
+            top_k: args.num("top-k", 0),
+            repeat_penalty: args.num("repeat-penalty", 1.0),
+            ..Sampler::default()
+        },
+        seed: args.num("seed", 0u64),
+        lookahead: args.num("draft", 0usize),
+        lookup: moe::Lookup { max_ngram: args.num("draft-ngram", 8usize).max(1), min_ngram: 2 },
+        logprobs: args.num("logprobs", 0usize),
+    }
+}
+
 /// The shape `--json` or `--schema` asks the output to have.
 fn shape_of(args: &Args) -> Option<moe::Grammar> {
     if let Some(path) = args.get("schema") {
@@ -485,6 +504,102 @@ fn prefill(m: &Model, ids: &[u32], st: &mut State) -> Vec<f32> {
     logits
 }
 
+/// `moe run <model> --prompts file.txt` — many prompts through one load.
+///
+/// Loading a large checkpoint costs more than answering a short prompt, so a
+/// hundred prompts should not pay for it a hundred times. The KV cache carries
+/// across prompts too: prompts sharing a prefix — a system message, a few-shot
+/// preamble, an instruction repeated with different inputs — prefill only what
+/// differs, which is where most of the saving comes from.
+fn batch(args: &Args, m: &Model, tok: Option<&Tokenizer>, plan: &moe::Plan) {
+    let file = args.get("prompts").unwrap();
+    let text = if file == "-" {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).unwrap_or_else(|e| fail(format!("stdin: {e}")));
+        s
+    } else {
+        std::fs::read_to_string(file).unwrap_or_else(|e| fail(format!("{file}: {e}")))
+    };
+    let prompts: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if prompts.is_empty() {
+        fail(format!("{file}: no prompts"));
+    }
+    let tok = tok.unwrap_or_else(|| fail("no tokenizer found; pass --tokenizer"));
+    let shape = shape_of(args);
+
+    let longest = prompts.iter().map(|p| tok.encode(p, m.spec.bos).len()).max().unwrap_or(0);
+    let ctx = args
+        .get("ctx")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| m.spec.max_ctx.min(4096))
+        .max(longest + plan.max_tokens + plan.lookahead + 1);
+    let mut st = State::new(m, ctx);
+    // `cached` is the token sequence the KV cache currently holds.
+    let mut cached: Vec<u32> = Vec::new();
+
+    let mut out = String::new();
+    let (mut total_tokens, mut total_reused, mut total_prompt) = (0usize, 0usize, 0usize);
+    let t0 = Instant::now();
+    for (i, prompt) in prompts.iter().enumerate() {
+        let ids = tok.encode(prompt, m.spec.bos);
+        if ids.is_empty() {
+            continue;
+        }
+        // Reuse whatever of this prompt the last one already left in the cache.
+        let common = ids.iter().zip(&cached).take_while(|(a, b)| a == b).count();
+        let keep = common.min(ids.len().saturating_sub(1));
+        st.truncate(keep);
+        cached.truncate(keep);
+        total_reused += keep;
+        total_prompt += ids.len();
+
+        let mut logits = Vec::new();
+        for chunk in ids[keep..].chunks(64) {
+            logits = m.forward(chunk, &mut st);
+            cached.extend_from_slice(chunk);
+        }
+        let mut guide = shape.clone().map(|g| moe::Guide::new(g, tok));
+        let mut produced = Vec::new();
+        let gen = moe::generate::generate(m, &mut st, &mut cached, logits, plan, guide.as_mut(), |t| {
+            produced.push(t);
+            true
+        });
+        total_tokens += gen.tokens;
+        out.push_str(
+            &serde_json::json!({
+                "index": i,
+                "prompt": prompt,
+                "text": tok.decode(&produced),
+                "tokens": gen.tokens,
+                "prompt_tokens": ids.len(),
+                "reused": keep,
+                "finish": gen.stop.reason(),
+            })
+            .to_string(),
+        );
+        out.push('\n');
+        eprint!("\r{}/{} prompts", i + 1, prompts.len());
+        let _ = std::io::stderr().flush();
+    }
+    eprint!("\r\x1b[K");
+    let secs = t0.elapsed().as_secs_f32();
+
+    match args.get("out") {
+        Some(p) => {
+            std::fs::write(p, &out).unwrap_or_else(|e| fail(format!("{p}: {e}")));
+            eprintln!("wrote {} results to {p}", prompts.len());
+        }
+        None => print!("{out}"),
+    }
+    eprintln!(
+        "{} prompts in {secs:.1}s | {total_prompt} prompt tokens, {total_reused} reused ({:.0}%) | {total_tokens} generated ({:.1} tok/s){}",
+        prompts.len(),
+        100.0 * total_reused as f32 / total_prompt.max(1) as f32,
+        total_tokens as f32 / secs.max(1e-6),
+        rss_note(" | "),
+    );
+}
+
 fn run(args: &Args, path: &Path) {
     let t_load = Instant::now();
     let mut m = load(path);
@@ -492,6 +607,12 @@ fn run(args: &Args, path: &Path) {
     m.routing = routing_of(args, &m);
     pin(args, &m);
     let tok = tokenizer_for(args, path, Some(&m.store));
+    // A file of prompts takes a different shape entirely: no streaming, one JSON
+    // result per line, and the cache carried from one prompt to the next.
+    if args.get("prompts").is_some() {
+        let plan = plan_of(args);
+        return batch(args, &m, tok.as_ref(), &plan);
+    }
     let ids = prompt_ids(args, tok.as_ref(), m.spec.bos);
     if ids.is_empty() {
         fail("empty prompt");
@@ -512,21 +633,7 @@ fn run(args: &Args, path: &Path) {
         eprintln!("warmed {} in {:.1}s", human(done), t.elapsed().as_secs_f32());
     }
 
-    let sampler = Sampler {
-        temp: args.num("temp", 0.0),
-        top_p: args.num("top-p", 0.95),
-        top_k: args.num("top-k", 0),
-        repeat_penalty: args.num("repeat-penalty", 1.0),
-        ..Sampler::default()
-    };
-    let plan = moe::Plan {
-        max_tokens: n_gen,
-        sampler,
-        seed: args.num("seed", 0u64),
-        lookahead: args.num("draft", 0usize),
-        lookup: moe::Lookup { max_ngram: args.num("draft-ngram", 8usize).max(1), min_ngram: 2 },
-        logprobs: args.num("logprobs", 0usize),
-    };
+    let plan = moe::Plan { max_tokens: n_gen, ..plan_of(args) };
     let stream = !args.on("no-stream");
     let mut guide = shape_of(args).map(|g| {
         let t = tok.as_ref().unwrap_or_else(|| fail("constrained decoding needs a tokenizer to mask against"));
