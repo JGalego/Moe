@@ -4,6 +4,29 @@ Moe does not have a per-architecture code path. It has one sparse-decoder
 implementation and a detection step that reads the checkpoint. A model works if
 its tensors are in that shape and use recognisable names.
 
+## What has actually been run
+
+Detection working is not the same as a model working, so this is the honest
+list — everything else is inference from the tensors, plus the synthetic
+fixtures in `tests/fixtures/`.
+
+| checkpoint | how | checked against |
+| --- | --- | --- |
+| OLMoE-1B-7B-0924-Instruct | safetensors, and packed to `.moe` | itself across formats; perplexity on held-out text |
+| OLMoE-1B-7B-0924-Instruct | `Q4_0` GGUF | its own bf16 weights |
+| Qwen1.5-MoE-A2.7B-Chat | `Q4_0` GGUF | llama.cpp, on the identical file |
+
+That last one is the strongest check available without a second engine of our
+own: same bytes, same tokens, two implementations. Per-token negative
+log-likelihood came to 0.4703 against llama.cpp's 0.4746 over 191 targets, and
+twenty greedy tokens were character-identical.
+
+Every one of those runs found a bug. Two architectures is not a lot.
+
+**Known not to work.** Granite MoE (`GraniteMoeForCausalLM`) names its
+feed-forward tensors differently and applies four scalar multipliers this
+engine does not implement; it is refused by name rather than misread.
+
 ## What the engine implements
 
 - RMSNorm; SwiGLU feed-forward

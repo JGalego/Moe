@@ -8,7 +8,7 @@
 class Moe < Formula
   desc "CPU inference for sparse mixture-of-experts language models"
   homepage "https://github.com/JGalego/Moe"
-  url "https://github.com/JGalego/Moe/archive/refs/tags/v0.1.0.tar.gz"
+  url "https://github.com/JGalego/Moe/archive/refs/tags/v0.2.0.tar.gz"
   license "MIT"
   head "https://github.com/JGalego/Moe.git", branch: "main"
 

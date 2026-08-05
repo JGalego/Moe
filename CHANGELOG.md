@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-08-05
 
 ### Formats
 
@@ -44,6 +44,15 @@
   escape that stepped one byte into a multi-byte character and panicked on the
   next slice, and an expression parser that recursed without limit — `((((…`
   overflowed the stack. The last two came out of `fuzz/`.
+- A beginning-of-sequence token is prepended only when the checkpoint asks for
+  one. GGUF files mostly omit the flag, so the default follows llama.cpp and
+  keys off the tokenizer model; Hugging Face checkpoints keep the flag in
+  `tokenizer_config.json` while the id lives in `config.json`, and only the id
+  was being read. Either mistake silently answers as a different model.
+- A Qwen-MoE GGUF loads its shared expert's gate, and does not renormalise its
+  top-k routing weights. Both were wrong, and neither was an error.
+- A GGUF is refused only for tensors the engine actually reads, and the error
+  names the tensor rather than only the format.
 
 ### New commands
 

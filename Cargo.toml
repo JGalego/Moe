@@ -2,7 +2,7 @@
 # The binary and the library are both `moe`; the registry slug carries the
 # tagline because `moe` alone was already taken.
 name = "moe-ontap"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # 1.85 is the floor its dependencies impose, not a preference: ureq requires
 # 1.85 and rayon 1.80, and 1.84's cargo cannot parse edition2024 manifests.
