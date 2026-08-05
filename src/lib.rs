@@ -18,6 +18,7 @@
 //! # }
 //! ```
 
+pub mod chat;
 pub mod draft;
 pub mod eval;
 pub mod fetch;
@@ -33,6 +34,7 @@ pub mod spec;
 pub mod store;
 pub mod tokenizer;
 
+pub use chat::Template;
 pub use draft::Lookup;
 pub use eval::Score;
 pub use fetch::{cache_dir, resolve, Source};

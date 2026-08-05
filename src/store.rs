@@ -45,6 +45,10 @@ pub struct Store {
     pub config: Value,
     /// `tokenizer.json` embedded at pack time, so a `.moe` is one portable file.
     pub tokenizer: Option<Value>,
+    /// The checkpoint's own chat template, from `tokenizer_config.json` or a
+    /// `chat_template.jinja` beside it. Carried through packing for the same
+    /// reason the tokenizer is: a prompt format is part of the model.
+    pub chat_template: Option<String>,
     pub path: PathBuf,
     pub packed: bool,
 }
@@ -128,7 +132,15 @@ impl Store {
         } else {
             Value::Null
         };
-        Ok(Store { maps, index, config, tokenizer: None, path: dir.into(), packed: false })
+        Ok(Store {
+            maps,
+            index,
+            config,
+            tokenizer: None,
+            chat_template: chat_template_in(dir),
+            path: dir.into(),
+            packed: false,
+        })
     }
 
     fn open_packed(file: &Path) -> io::Result<Store> {
@@ -167,6 +179,7 @@ impl Store {
                 Value::Null => None,
                 v => Some(v.clone()),
             },
+            chat_template: head["chat_template"].as_str().map(String::from),
             path: file.into(),
             packed: true,
         })
@@ -277,7 +290,18 @@ impl Store {
                 std::fs::read(self.path.join("tokenizer.json")).ok().and_then(|b| serde_json::from_slice(&b).ok())
             })
             .unwrap_or(Value::Null);
-        let header = json!({"config": self.config, "tokenizer": tokenizer, "tensors": Value::Object(tensors)});
+        let chat = self
+            .chat_template
+            .clone()
+            .or_else(|| chat_template_in(&self.path))
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        let header = json!({
+            "config": self.config,
+            "tokenizer": tokenizer,
+            "chat_template": chat,
+            "tensors": Value::Object(tensors),
+        });
         let hbytes = serde_json::to_vec(&header)?;
 
         let mut f = io::BufWriter::with_capacity(1 << 22, File::create(out)?);
@@ -302,6 +326,32 @@ impl Store {
             }
         }
         f.flush()
+    }
+}
+
+/// Find a chat template beside a checkpoint.
+///
+/// Two conventions: a `chat_template` key in `tokenizer_config.json`, and — the
+/// newer one, since embedding Jinja in JSON is miserable — a `chat_template.jinja`
+/// file of its own. Some checkpoints ship a *list* of named templates; the one
+/// called `default` is the chat one, and the rest are for tool use.
+pub fn chat_template_in(dir: &Path) -> Option<String> {
+    let dir = if dir.is_dir() { dir.to_path_buf() } else { dir.parent()?.to_path_buf() };
+    if let Ok(s) = std::fs::read_to_string(dir.join("chat_template.jinja")) {
+        if !s.trim().is_empty() {
+            return Some(s);
+        }
+    }
+    let raw = std::fs::read(dir.join("tokenizer_config.json")).ok()?;
+    let cfg: Value = serde_json::from_slice(&raw).ok()?;
+    match &cfg["chat_template"] {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(list) => list
+            .iter()
+            .find(|t| t["name"] == "default")
+            .or_else(|| list.first())
+            .and_then(|t| t["template"].as_str().map(String::from)),
+        _ => None,
     }
 }
 

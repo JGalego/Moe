@@ -6,6 +6,7 @@
 //! instead, which also lets that session keep its KV cache warm between them —
 //! the reason a second chat turn only prefills the message that was added.
 
+use crate::chat::Template;
 use crate::draft::Lookup;
 use crate::generate::{generate, Plan};
 use crate::grammar::{Grammar, Guide};
@@ -121,10 +122,61 @@ struct Session {
     history: Vec<u32>,
 }
 
+/// How a chat turn becomes a prompt: the checkpoint's own template if it ships
+/// one the engine can render, otherwise a format inferred from the vocabulary.
+pub enum Prompting {
+    /// The template `tokenizer_config.json` declared.
+    Template(Template),
+    /// One of the three built-in shapes, matched on a control token.
+    Detected(ChatFormat),
+}
+
+impl Prompting {
+    /// Prefer the checkpoint's declaration; fall back to detection when it is
+    /// absent or uses Jinja beyond what this engine renders. Falling back is
+    /// better than failing, and both are better than rendering it wrongly.
+    pub fn resolve(template: Option<&str>, tok: Option<&Tokenizer>) -> Option<Prompting> {
+        if let Some(src) = template {
+            match Template::parse(src) {
+                Ok(t) => return Some(Prompting::Template(t)),
+                Err(e) => {
+                    eprintln!("moe: the checkpoint's chat template is beyond this engine ({e}); detecting instead")
+                }
+            }
+        }
+        tok.and_then(ChatFormat::detect).map(Prompting::Detected)
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Prompting::Template(_) => "the checkpoint's own template",
+            Prompting::Detected(f) => f.name,
+        }
+    }
+
+    /// The marker that closes an assistant turn, which is also where generation
+    /// should stop whether or not the checkpoint made it an EOS token.
+    fn turn_end(&self) -> Option<&str> {
+        match self {
+            Prompting::Detected(f) => Some(f.assistant.1).filter(|e| !e.is_empty()),
+            // A template's stop marker is the checkpoint's EOS, which the decode
+            // loop already honours.
+            Prompting::Template(_) => None,
+        }
+    }
+
+    fn render(&self, messages: &[Value], bos: &str, eos: &str) -> Result<String, String> {
+        match self {
+            Prompting::Template(t) => t.render(messages, true, bos, eos),
+            Prompting::Detected(f) => f.render(messages),
+        }
+    }
+}
+
 pub struct Server {
     model: Model,
     tok: Option<Tokenizer>,
-    chat: Option<ChatFormat>,
+    chat: Option<Prompting>,
     name: String,
     session: Mutex<Session>,
     queued: AtomicUsize,
@@ -167,7 +219,7 @@ impl Server {
     pub fn new(
         model: Model,
         tok: Option<Tokenizer>,
-        chat: Option<ChatFormat>,
+        chat: Option<Prompting>,
         name: String,
         ctx: usize,
         prefix_cache: bool,
@@ -187,8 +239,8 @@ impl Server {
         }
     }
 
-    pub fn chat_format(&self) -> Option<ChatFormat> {
-        self.chat
+    pub fn chat_format(&self) -> Option<&Prompting> {
+        self.chat.as_ref()
     }
 
     fn encode(&self, text: &str, bos: bool) -> Result<Vec<u32>, String> {
@@ -375,11 +427,15 @@ impl Server {
     fn prompt_from(&self, body: &Value, chat: bool) -> Result<Vec<u32>, String> {
         if chat {
             let messages = body["messages"].as_array().ok_or("messages must be an array")?;
-            let fmt = self.chat.ok_or(
+            let fmt = self.chat.as_ref().ok_or(
                 "this checkpoint declares no chat template, so its prompt format is unknown. \
                  Pass --chat-format (chatml, llama3, mistral) or use /v1/completions",
             )?;
-            return self.encode(&fmt.render(messages)?, false);
+            // A template emits its own BOS if it wants one, so never add a second.
+            let bos = self.tok.as_ref().zip(self.model.spec.bos).map(|(t, b)| t.decode_one(b)).unwrap_or_default();
+            let eos =
+                self.tok.as_ref().zip(self.model.spec.eos.first()).map(|(t, e)| t.decode_one(*e)).unwrap_or_default();
+            return self.encode(&fmt.render(messages, &bos, &eos)?, false);
         }
         match &body["prompt"] {
             Value::String(s) => self.encode(s, true),
@@ -405,7 +461,7 @@ impl Server {
         // A chat turn ends at the format's own closing marker, whether or not
         // the checkpoint made that marker its EOS token.
         if chat {
-            if let Some(end) = self.chat.map(|f| f.assistant.1).filter(|e| !e.is_empty()) {
+            if let Some(end) = self.chat.as_ref().and_then(|c| c.turn_end()) {
                 p.stop.push(end.to_string());
             }
         }
@@ -488,7 +544,7 @@ pub fn run(server: Server, host: &str, port: u16) -> std::io::Result<()> {
     let addr = listener.local_addr()?;
     eprintln!("moe serve: http://{addr}  (model {})", server.name);
     match server.chat_format() {
-        Some(f) => eprintln!("  chat format: {}", f.name),
+        Some(f) => eprintln!("  chat format: {}", f.name()),
         None => eprintln!("  chat format: none detected — /v1/chat/completions will refuse; use /v1/completions"),
     }
     let server = std::sync::Arc::new(server);

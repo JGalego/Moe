@@ -486,11 +486,12 @@ fn serve(args: &Args, path: &Path, spec: &str) {
     pin(args, &m);
     let tok = tokenizer_for(args, path, Some(&m.store));
     let chat = match args.get("chat-format") {
-        Some(name) => Some(
+        // An explicit name overrides whatever the checkpoint declares.
+        Some(name) => Some(moe::serve::Prompting::Detected(
             moe::ChatFormat::by_name(name)
                 .unwrap_or_else(|| fail(format!("unknown chat format '{name}' (chatml, llama3, mistral)"))),
-        ),
-        None => tok.as_ref().and_then(moe::ChatFormat::detect),
+        )),
+        None => moe::serve::Prompting::resolve(m.store.chat_template.as_deref(), tok.as_ref()),
     };
     let ctx = args.num("ctx", 4096usize).min(m.spec.max_ctx);
     let name = spec.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("model").to_string();
