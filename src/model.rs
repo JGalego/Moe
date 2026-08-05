@@ -440,8 +440,19 @@ impl Model {
                     shared_gate: g("mlp.shared_expert_gate.weight"),
                 }
             } else {
+                // A layer with neither a recognised router nor a recognised
+                // dense feed-forward is an architecture this engine has not been
+                // taught, not a broken checkpoint — so say which one it is.
+                let dense = alt("mlp.gate_proj.weight", "mlp.w1.weight");
+                if dense.is_none() {
+                    let arch = store.config["architectures"][0].as_str().unwrap_or("this checkpoint");
+                    return Err(format!(
+                        "{arch}: layer {l} has no feed-forward this engine recognises. \
+                         Its tensors are named something docs/MODELS.md does not list."
+                    ));
+                }
                 Ffn::Dense(Mlp {
-                    gate: need(alt("mlp.gate_proj.weight", "mlp.w1.weight"), "mlp.gate_proj")?,
+                    gate: need(dense, "mlp.gate_proj")?,
                     up: need(alt("mlp.up_proj.weight", "mlp.w3.weight"), "mlp.up_proj")?,
                     down: need(alt("mlp.down_proj.weight", "mlp.w2.weight"), "mlp.down_proj")?,
                 })

@@ -323,7 +323,7 @@ impl Gguf {
                 Meta::Bool(b) => Some(*b),
                 other => other.as_i64().map(|i| i != 0),
             })
-            .unwrap_or_else(|| !matches!(self.arch(), "olmoe"));
+            .unwrap_or_else(|| !matches!(self.arch(), "olmoe" | "qwen2moe" | "grok"));
         set(&mut c, "norm_topk_prob", Some(json!(norm)));
         set(&mut c, "rms_norm_eps", float(self, "attention.layer_norm_rms_epsilon").map(|v| json!(v)));
         set(&mut c, "rope_theta", float(self, "rope.freq_base").map(|v| json!(v)));
@@ -428,7 +428,7 @@ pub fn rename(name: &str) -> Option<String> {
     let (layer, suffix) = rest.split_once('.')?;
     layer.parse::<u32>().ok()?;
     // Longest first, so `attn_q_norm` is not matched as `attn_q`.
-    const MAP: [(&str, &str); 21] = [
+    const MAP: [(&str, &str); 22] = [
         ("attn_norm.weight", "input_layernorm.weight"),
         ("attn_q_norm.weight", "self_attn.q_norm.weight"),
         ("attn_k_norm.weight", "self_attn.k_norm.weight"),
@@ -447,10 +447,13 @@ pub fn rename(name: &str) -> Option<String> {
         ("ffn_gate_exps.weight", "mlp.experts.gate_proj"),
         ("ffn_up_exps.weight", "mlp.experts.up_proj"),
         ("ffn_down_exps.weight", "mlp.experts.down_proj"),
-        // A shared expert every token also runs.
+        // A shared expert every token also runs, and the sigmoid gate that
+        // scales it. Without the gate the shared expert runs at full strength,
+        // which is wrong rather than merely different.
         ("ffn_gate_shexp.weight", "mlp.shared_expert.gate_proj.weight"),
         ("ffn_up_shexp.weight", "mlp.shared_expert.up_proj.weight"),
         ("ffn_down_shexp.weight", "mlp.shared_expert.down_proj.weight"),
+        ("ffn_gate_inp_shexp.weight", "mlp.shared_expert_gate.weight"),
         // Dense layers, including the dense prefix of a sparse model.
         ("ffn_gate.weight", "mlp.gate_proj.weight"),
         ("ffn_up.weight", "mlp.up_proj.weight"),
@@ -655,11 +658,20 @@ mod tests {
         // Absent, so it takes the general default.
         assert_eq!(cfg["norm_topk_prob"], true);
 
-        // OLMoE does not renormalise, and no OLMoE GGUF says so — llama.cpp
-        // folds it into the architecture. The default has to know that.
-        let mut o = Builder::new();
-        o.str_kv("general.architecture", "olmoe").u32_kv("olmoe.expert_count", 64);
-        assert_eq!(Gguf::parse(&o.build()).unwrap().config()["norm_topk_prob"], false);
+        // OLMoE and Qwen1.5-MoE do not renormalise, and no GGUF of either says
+        // so — llama.cpp folds it into the architecture. The default has to know
+        // the same table, because the mistake is silent.
+        for arch in ["olmoe", "qwen2moe", "grok"] {
+            let mut o = Builder::new();
+            o.str_kv("general.architecture", arch).u32_kv(&format!("{arch}.expert_count"), 64);
+            assert_eq!(Gguf::parse(&o.build()).unwrap().config()["norm_topk_prob"], false, "{arch}");
+        }
+        // Everything else does, Qwen3-MoE included — it changed between versions.
+        for arch in ["llama", "qwen3moe", "deepseek2"] {
+            let mut o = Builder::new();
+            o.str_kv("general.architecture", arch).u32_kv(&format!("{arch}.expert_count"), 64);
+            assert_eq!(Gguf::parse(&o.build()).unwrap().config()["norm_topk_prob"], true, "{arch}");
+        }
 
         // An explicit key always wins over the architecture default.
         let mut e = Builder::new();
@@ -722,6 +734,9 @@ mod tests {
             ("blk.1.ffn_down_exps.weight", "model.layers.1.mlp.experts.down_proj"),
             ("blk.1.ffn_down.weight", "model.layers.1.mlp.down_proj.weight"),
             ("blk.1.ffn_gate_shexp.weight", "model.layers.1.mlp.shared_expert.gate_proj.weight"),
+            // The shared expert's gate. Its name starts with the router's, so a
+            // prefix match here would silently make one of them the other.
+            ("blk.1.ffn_gate_inp_shexp.weight", "model.layers.1.mlp.shared_expert_gate.weight"),
         ] {
             assert_eq!(rename(from).as_deref(), Some(to), "{from}");
         }
