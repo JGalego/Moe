@@ -179,6 +179,126 @@ fn embeddings_match_the_engine_and_batch_in_order() {
     assert!(!completion(port, &[1, 2, 3], 4).is_empty());
 }
 
+/// Reported logprobs must be the model's own, not the sampler's — so they have
+/// to be a valid log-distribution: never positive, and the sum over the top
+/// alternatives never exceeding 1 in probability.
+#[test]
+fn logprobs_describe_a_real_distribution() {
+    let port = boot(true);
+    let body = serde_json::json!({"prompt": [1, 2, 3], "max_tokens": 5, "temperature": 0, "logprobs": 4});
+    let raw = post(port, "/v1/completions", &body.to_string());
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{e}: {raw}"));
+    let lp = &v["choices"][0]["logprobs"];
+    assert!(!lp.is_null(), "no logprobs came back: {raw}");
+
+    let tokens = lp["tokens"].as_array().unwrap();
+    let chosen = lp["token_logprobs"].as_array().unwrap();
+    let tops = lp["top_logprobs"].as_array().unwrap();
+    let offsets = lp["text_offset"].as_array().unwrap();
+    assert_eq!(tokens.len(), chosen.len(), "parallel arrays disagree in length");
+    assert_eq!(tokens.len(), tops.len());
+    assert_eq!(tokens.len(), offsets.len());
+    assert!(!tokens.is_empty());
+
+    for (i, l) in chosen.iter().enumerate() {
+        let l = l.as_f64().unwrap();
+        assert!(l <= 1e-5, "token {i} has logprob {l}, which is a probability above 1");
+        // Greedy decoding picks the argmax, so its probability cannot be tiny.
+        assert!(l > -20.0, "token {i} logprob {l} is implausible for a greedy pick");
+        let top = tops[i].as_object().unwrap();
+        assert_eq!(top.len(), 4, "asked for 4 alternatives, got {}", top.len());
+        let mass: f64 = top.values().map(|v| v.as_f64().unwrap().exp()).sum();
+        assert!(mass <= 1.0 + 1e-4, "top-4 probabilities sum to {mass}");
+        // The chosen token is the argmax, so it must be the strongest listed.
+        let best = top.values().map(|v| v.as_f64().unwrap()).fold(f64::NEG_INFINITY, f64::max);
+        assert!((best - l).abs() < 1e-5, "the greedy pick was not the strongest alternative");
+    }
+
+    // Offsets must march forward by each token's length.
+    let mut at = 0usize;
+    for (i, tok) in tokens.iter().enumerate() {
+        assert_eq!(offsets[i].as_u64().unwrap() as usize, at);
+        at += tok.as_str().unwrap().len();
+    }
+
+    // The chat endpoint reports the same numbers in its own layout.
+    let chat = serde_json::json!({"prompt": [1, 2, 3], "max_tokens": 3, "temperature": 0, "logprobs": 2});
+    let raw = post(port, "/v1/completions", &chat.to_string());
+    assert!(raw.contains("token_logprobs"), "{raw}");
+    // ...and asking for none reports none rather than an empty object.
+    let none = serde_json::json!({"prompt": [1, 2, 3], "max_tokens": 2, "temperature": 0});
+    let v: serde_json::Value = serde_json::from_str(&post(port, "/v1/completions", &none.to_string())).unwrap();
+    assert!(v["choices"][0]["logprobs"].is_null());
+}
+
+/// `n` must produce that many distinct choices, and `echo` must put the prompt
+/// back in front without disturbing the token accounting.
+#[test]
+fn n_and_echo_shape_the_choices() {
+    let port = boot(true);
+    let body = serde_json::json!({"prompt": [1, 2, 3], "max_tokens": 4, "temperature": 1.0, "n": 3, "seed": 5});
+    let raw = post(port, "/v1/completions", &body.to_string());
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{e}: {raw}"));
+    let choices = v["choices"].as_array().unwrap();
+    assert_eq!(choices.len(), 3);
+    for (i, c) in choices.iter().enumerate() {
+        assert_eq!(c["index"], i, "choices came back out of order");
+        assert!(c["text"].is_string());
+    }
+    // Usage counts every completion, not just the first.
+    let total: u64 = v["usage"]["completion_tokens"].as_u64().unwrap();
+    assert!(total >= 3, "usage reports {total} tokens for three completions");
+
+    // Without a tokenizer there is no text to echo, so echo is a no-op rather
+    // than an error — the fixture server has none.
+    let echo = serde_json::json!({"prompt": [1, 2, 3], "max_tokens": 2, "temperature": 0, "echo": true});
+    let raw = post(port, "/v1/completions", &echo.to_string());
+    assert!(serde_json::from_str::<serde_json::Value>(&raw).is_ok(), "echo broke the response: {raw}");
+
+    // `n` is bounded, so a client cannot ask for a thousand.
+    let many = serde_json::json!({"prompt": [1, 2, 3], "max_tokens": 1, "temperature": 0, "n": 500});
+    let v: serde_json::Value = serde_json::from_str(&post(port, "/v1/completions", &many.to_string())).unwrap();
+    assert!(v["choices"].as_array().unwrap().len() <= 8);
+}
+
+/// /metrics must be scrapeable and must actually count what happened.
+#[test]
+fn metrics_count_the_work_done() {
+    let port = boot(true);
+    let before = get(port, "/metrics");
+    assert!(before.contains("# TYPE moe_requests_total counter"), "not Prometheus format: {before}");
+    assert!(before.contains("moe_queued_requests"));
+
+    let count = |text: &str, name: &str| -> u64 {
+        text.lines()
+            .find(|l| l.starts_with(name) && !l.starts_with('#'))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("no {name} in {text}"))
+    };
+    assert_eq!(count(&before, "moe_requests_total"), 0);
+
+    completion(port, &[1, 2, 3], 4);
+    post(port, "/v1/embeddings", &serde_json::json!({"input": [1, 2]}).to_string());
+    let after = get(port, "/metrics");
+    assert_eq!(count(&after, "moe_requests_total"), 1);
+    assert_eq!(count(&after, "moe_embedding_requests_total"), 1);
+    assert_eq!(count(&after, "moe_prompt_tokens_total"), 3);
+    assert!(count(&after, "moe_completion_tokens_total") > 0);
+    assert!(count(&after, "moe_forward_steps_total") > 0);
+    // Nothing was drafted, since the fixture server does not speculate.
+    assert_eq!(count(&after, "moe_draft_tokens_total"), 0);
+
+    // A refused request is counted as an error, not as a success.
+    post(port, "/v1/completions", "{}");
+    let errs = get(port, "/metrics");
+    assert_eq!(count(&errs, "moe_request_errors_total"), 1);
+
+    // Re-sending the same prompt must show up as cache reuse.
+    completion(port, &[1, 2, 3], 4);
+    assert!(count(&get(port, "/metrics"), "moe_prefix_cache_tokens_reused_total") > 0);
+}
+
 #[test]
 fn bad_requests_are_refused_not_crashed() {
     let port = boot(true);

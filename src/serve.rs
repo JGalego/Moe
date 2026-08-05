@@ -8,14 +8,14 @@
 
 use crate::chat::Template;
 use crate::draft::Lookup;
-use crate::generate::{generate, Plan};
+use crate::generate::{generate, Plan, TokenProb};
 use crate::grammar::{Grammar, Guide};
 use crate::http::{self, Conn, Request};
 use crate::model::{Model, Pool, State};
 use crate::sample::Sampler;
 use crate::tokenizer::{Stream, Tokenizer};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -173,6 +173,64 @@ impl Prompting {
     }
 }
 
+/// Counters for `/metrics`, in the shape Prometheus scrapes.
+///
+/// Deliberately plain: monotonic counters and one gauge, no histograms. The
+/// interesting numbers for this engine are not latency percentiles but how much
+/// work the prefix cache and the drafter are saving, which counters answer
+/// exactly.
+#[derive(Default)]
+pub struct Metrics {
+    requests: AtomicU64,
+    errors: AtomicU64,
+    embeddings: AtomicU64,
+    prompt_tokens: AtomicU64,
+    completion_tokens: AtomicU64,
+    /// Prompt tokens the cache already held, so they were never re-run.
+    reused_tokens: AtomicU64,
+    drafted: AtomicU64,
+    accepted: AtomicU64,
+    steps: AtomicU64,
+}
+
+impl Metrics {
+    fn record(&self, o: &crate::generate::Outcome, prompt: usize, reused: usize) {
+        self.prompt_tokens.fetch_add(prompt as u64, Ordering::Relaxed);
+        self.completion_tokens.fetch_add(o.tokens as u64, Ordering::Relaxed);
+        self.reused_tokens.fetch_add(reused as u64, Ordering::Relaxed);
+        self.drafted.fetch_add(o.drafted as u64, Ordering::Relaxed);
+        self.accepted.fetch_add(o.accepted as u64, Ordering::Relaxed);
+        self.steps.fetch_add(o.steps as u64, Ordering::Relaxed);
+    }
+
+    /// The Prometheus text exposition format, written by hand because it is six
+    /// lines of it and a dependency would be larger than the feature.
+    fn render(&self, queued: usize) -> String {
+        let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        let mut out = String::new();
+        for (name, help, kind, value) in [
+            ("moe_requests_total", "Completion requests served.", "counter", g(&self.requests)),
+            ("moe_request_errors_total", "Requests refused.", "counter", g(&self.errors)),
+            ("moe_embedding_requests_total", "Embedding requests served.", "counter", g(&self.embeddings)),
+            ("moe_prompt_tokens_total", "Prompt tokens submitted.", "counter", g(&self.prompt_tokens)),
+            ("moe_completion_tokens_total", "Tokens generated.", "counter", g(&self.completion_tokens)),
+            (
+                "moe_prefix_cache_tokens_reused_total",
+                "Prompt tokens the KV cache already held.",
+                "counter",
+                g(&self.reused_tokens),
+            ),
+            ("moe_draft_tokens_total", "Tokens proposed by the drafter.", "counter", g(&self.drafted)),
+            ("moe_draft_accepted_total", "Drafted tokens the model agreed with.", "counter", g(&self.accepted)),
+            ("moe_forward_steps_total", "Forward passes run while decoding.", "counter", g(&self.steps)),
+            ("moe_queued_requests", "Requests waiting on the session.", "gauge", queued as u64),
+        ] {
+            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"));
+        }
+        out
+    }
+}
+
 pub struct Server {
     model: Model,
     tok: Option<Tokenizer>,
@@ -187,6 +245,7 @@ pub struct Server {
     pub lookahead: usize,
     /// How /v1/embeddings pools hidden states.
     pub pool: Pool,
+    metrics: Metrics,
 }
 
 struct Params {
@@ -194,12 +253,17 @@ struct Params {
     stop: Vec<String>,
     /// The shape the answer must have, from `response_format`.
     shape: Option<Grammar>,
+    /// Completions to produce. Each runs in turn on the one session.
+    n: usize,
+    /// Whether to put the prompt back in front of the completion.
+    echo: bool,
 }
 
 struct Gen {
     text: String,
     tokens: usize,
     finish: &'static str,
+    probs: Vec<TokenProb>,
 }
 
 fn now() -> u64 {
@@ -239,6 +303,7 @@ impl Server {
             cors: false,
             lookahead: 0,
             pool: Pool::Mean,
+            metrics: Metrics::default(),
         }
     }
 
@@ -273,9 +338,18 @@ impl Server {
                 seed: body["seed"].as_u64().unwrap_or_else(|| now().wrapping_mul(2654435761)),
                 lookahead: self.lookahead,
                 lookup: Lookup::default(),
+                // /v1/completions asks with a count; chat asks with a flag plus
+                // a separate count, and wants at least the chosen token either way.
+                logprobs: match &body["logprobs"] {
+                    Value::Number(n) => n.as_u64().unwrap_or(0).min(20) as usize,
+                    Value::Bool(true) => body["top_logprobs"].as_u64().unwrap_or(0).clamp(1, 20) as usize,
+                    _ => 0,
+                },
             },
             stop,
             shape: Self::shape_of(&body["response_format"]),
+            n: body["n"].as_u64().unwrap_or(1).clamp(1, 8) as usize,
+            echo: body["echo"].as_bool().unwrap_or(false),
         }
     }
 
@@ -377,28 +451,93 @@ impl Server {
             on_delta(&text[emitted..]);
         }
         let finish = if hit_stop { "stop" } else { outcome.stop.reason() };
-        Ok(Gen { text, tokens: outcome.tokens, finish })
+        self.metrics.record(&outcome, prompt.len(), keep);
+        Ok(Gen { text, tokens: outcome.tokens, finish, probs: outcome.logprobs })
     }
 
-    fn completion_body(&self, chat: bool, g: &Gen, prompt_tokens: usize) -> String {
-        let (object, choice) = if chat {
-            (
-                "chat.completion",
-                json!({"index": 0, "message": {"role": "assistant", "content": g.text}, "finish_reason": g.finish}),
-            )
-        } else {
-            ("text_completion", json!({"index": 0, "text": g.text, "finish_reason": g.finish}))
-        };
+    /// Decode one token for display in a logprobs payload.
+    fn piece(&self, id: u32) -> String {
+        match self.tok.as_ref() {
+            Some(t) => t.decode_one(id),
+            None => id.to_string(),
+        }
+    }
+
+    /// `logprobs`, in whichever of the two shapes the endpoint uses.
+    ///
+    /// `/v1/completions` reports parallel arrays with byte offsets;
+    /// `/v1/chat/completions` reports a list of per-token objects. Same numbers,
+    /// two layouts, because the API grew them at different times.
+    fn logprobs_body(&self, chat: bool, g: &Gen) -> Option<Value> {
+        if g.probs.is_empty() {
+            return None;
+        }
+        if chat {
+            let content: Vec<Value> = g
+                .probs
+                .iter()
+                .map(|p| {
+                    json!({
+                        "token": self.piece(p.token),
+                        "logprob": p.logprob,
+                        "top_logprobs": p.top.iter().map(|(t, l)| json!({"token": self.piece(*t), "logprob": l}))
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            return Some(json!({"content": content}));
+        }
+        let mut offsets = Vec::with_capacity(g.probs.len());
+        let mut at = 0usize;
+        let tokens: Vec<String> = g
+            .probs
+            .iter()
+            .map(|p| {
+                offsets.push(at);
+                let s = self.piece(p.token);
+                at += s.len();
+                s
+            })
+            .collect();
+        Some(json!({
+            "tokens": tokens,
+            "token_logprobs": g.probs.iter().map(|p| p.logprob).collect::<Vec<_>>(),
+            "top_logprobs": g.probs.iter().map(|p| {
+                p.top.iter().map(|(t, l)| (self.piece(*t), json!(l))).collect::<serde_json::Map<String, Value>>()
+            }).collect::<Vec<_>>(),
+            "text_offset": offsets,
+        }))
+    }
+
+    fn completion_body(&self, chat: bool, gens: &[Gen], prompt_tokens: usize) -> String {
+        let object = if chat { "chat.completion" } else { "text_completion" };
+        let choices: Vec<Value> = gens
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                let mut c = if chat {
+                    json!({"index": i, "message": {"role": "assistant", "content": g.text}, "finish_reason": g.finish})
+                } else {
+                    json!({"index": i, "text": g.text, "finish_reason": g.finish})
+                };
+                match self.logprobs_body(chat, g) {
+                    Some(lp) => c["logprobs"] = lp,
+                    None => c["logprobs"] = Value::Null,
+                }
+                c
+            })
+            .collect();
+        let completion: usize = gens.iter().map(|g| g.tokens).sum();
         json!({
             "id": format!("cmpl-{}", now()),
             "object": object,
             "created": now(),
             "model": self.name,
-            "choices": [choice],
+            "choices": choices,
             "usage": {
                 "prompt_tokens": prompt_tokens,
-                "completion_tokens": g.tokens,
-                "total_tokens": prompt_tokens + g.tokens,
+                "completion_tokens": completion,
+                "total_tokens": prompt_tokens + completion,
             },
         })
         .to_string()
@@ -456,6 +595,7 @@ impl Server {
     /// Embedding is stateless — no cache to reuse, no tokens to sample — so a
     /// batch is just a loop, and it does not touch the generation session at all.
     fn embeddings(&self, req: &Request, conn: &mut Conn) {
+        self.metrics.embeddings.fetch_add(1, Ordering::Relaxed);
         let body: Value = match serde_json::from_slice(&req.body) {
             Ok(v) => v,
             Err(e) => return drop(conn.error(400, &format!("invalid JSON: {e}"))),
@@ -510,13 +650,21 @@ impl Server {
     }
 
     fn completions(&self, req: &Request, conn: &mut Conn, chat: bool) {
+        // Counted here rather than after parsing, so a malformed request still
+        // appears in the totals — an error rate computed over only the requests
+        // that parsed would be the wrong denominator.
+        self.metrics.requests.fetch_add(1, Ordering::Relaxed);
+        let refuse = |conn: &mut Conn, msg: &str| {
+            self.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            drop(conn.error(400, msg))
+        };
         let body: Value = match serde_json::from_slice(&req.body) {
             Ok(v) => v,
-            Err(e) => return drop(conn.error(400, &format!("invalid JSON: {e}"))),
+            Err(e) => return refuse(conn, &format!("invalid JSON: {e}")),
         };
         let prompt = match self.prompt_from(&body, chat) {
             Ok(p) => p,
-            Err(e) => return drop(conn.error(400, &e)),
+            Err(e) => return refuse(conn, &e),
         };
         let mut p = self.params(&body);
         // A chat turn ends at the format's own closing marker, whether or not
@@ -527,13 +675,28 @@ impl Server {
             }
         }
         let streaming = body["stream"].as_bool().unwrap_or(false);
+        // Echo puts the prompt back in front, which only means anything if the
+        // prompt can be decoded back into text.
+        let echoed =
+            if p.echo { self.tok.as_ref().map(|t| t.decode(&prompt)).unwrap_or_default() } else { String::new() };
 
         if !streaming {
-            match self.generate(&prompt, &p, |_| {}) {
-                Ok(g) => drop(conn.json(200, &self.completion_body(chat, &g, prompt.len()))),
-                Err(e) => drop(conn.error(400, &e)),
+            let mut gens = Vec::with_capacity(p.n);
+            for i in 0..p.n {
+                // Each completion gets its own seed, or `n` would return the
+                // same text `n` times.
+                let mut p =
+                    Params { plan: p.plan.clone(), stop: p.stop.clone(), shape: p.shape.clone(), n: 1, echo: p.echo };
+                p.plan.seed = p.plan.seed.wrapping_add(i as u64);
+                match self.generate(&prompt, &p, |_| {}) {
+                    Ok(mut g) => {
+                        g.text = format!("{echoed}{}", g.text);
+                        gens.push(g);
+                    }
+                    Err(e) => return refuse(conn, &e),
+                }
             }
-            return;
+            return drop(conn.json(200, &self.completion_body(chat, &gens, prompt.len())));
         }
 
         if conn.sse_open().is_err() {
@@ -541,6 +704,10 @@ impl Server {
         }
         let mut first = true;
         let mut failed = None;
+        if !echoed.is_empty() {
+            let _ = conn.sse(&self.chunk_body(chat, &echoed, true, None));
+            first = false;
+        }
         let result = self.generate(&prompt, &p, |delta| {
             let body = self.chunk_body(chat, delta, first, None);
             first = false;
@@ -555,6 +722,7 @@ impl Server {
             }
             // The stream is already open, so an error can only be reported inside it.
             Err(e) => {
+                self.metrics.errors.fetch_add(1, Ordering::Relaxed);
                 let _ = conn.sse(&json!({"error": {"message": e}}).to_string());
                 let _ = conn.sse_close();
             }
@@ -575,6 +743,10 @@ impl Server {
                         {"id": self.name, "object": "model", "created": 0, "owned_by": "moe"}
                     ]});
                     drop(conn.json(200, &body.to_string()))
+                }
+                "/metrics" => {
+                    let body = self.metrics.render(self.queued.load(Ordering::SeqCst));
+                    drop(conn.text(200, &body))
                 }
                 _ => drop(conn.error(404, "not found")),
             };

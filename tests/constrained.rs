@@ -75,6 +75,7 @@ fn constrained(g: Grammar, max_tokens: usize, lookahead: usize, temp: f32, seed:
         seed,
         lookahead,
         lookup: Lookup { max_ngram: 4, min_ngram: 2 },
+        logprobs: 0,
     };
     let mut out = Vec::new();
     let o = generate(&m, &mut st, &mut prompt.clone(), logits, &plan, Some(&mut guide), |t| {

@@ -48,6 +48,7 @@ RUN OPTIONS
       --draft-ngram N       longest suffix the drafter matches         [8]
       --json                emit only valid JSON, enforced while decoding
       --schema PATH         emit only JSON matching this JSON Schema
+      --logprobs N          report each token's logprob and N alternatives
       --no-prefetch         stop advising the kernel about the next step's experts
       --pin TRACE.jsonl     keep the experts that trace used resident
       --pin-budget GB       how much to keep resident                  [2]
@@ -411,6 +412,7 @@ fn run(args: &Args, path: &Path) {
         seed: args.num("seed", 0u64),
         lookahead: args.num("draft", 0usize),
         lookup: moe::Lookup { max_ngram: args.num("draft-ngram", 8usize).max(1), min_ngram: 2 },
+        logprobs: args.num("logprobs", 0usize),
     };
     let stream = !args.on("no-stream");
     let mut guide = shape_of(args).map(|g| {

@@ -25,6 +25,7 @@ fn plan(lookahead: usize, temp: f32, max_tokens: usize) -> Plan {
         seed: 7,
         lookahead,
         lookup: Lookup { max_ngram: 6, min_ngram: 2 },
+        logprobs: 0,
     }
 }
 

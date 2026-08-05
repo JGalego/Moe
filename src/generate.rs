@@ -26,11 +26,21 @@ pub struct Plan {
     /// Tokens to draft per step. 0 disables speculation entirely.
     pub lookahead: usize,
     pub lookup: Lookup,
+    /// Alternatives to report per committed token. 0 records nothing at all,
+    /// which is the default because the top-k scan is not free.
+    pub logprobs: usize,
 }
 
 impl Default for Plan {
     fn default() -> Plan {
-        Plan { max_tokens: 128, sampler: Sampler::default(), seed: 0, lookahead: 0, lookup: Lookup::default() }
+        Plan {
+            max_tokens: 128,
+            sampler: Sampler::default(),
+            seed: 0,
+            lookahead: 0,
+            lookup: Lookup::default(),
+            logprobs: 0,
+        }
     }
 }
 
@@ -64,6 +74,36 @@ impl Stop {
     }
 }
 
+/// What the model thought of a token it committed.
+///
+/// Reported from the *raw* logits, before temperature or any penalty: the useful
+/// question is how likely the model found this token, not how likely the sampler
+/// was made to find it.
+#[derive(Clone, Debug)]
+pub struct TokenProb {
+    pub token: u32,
+    pub logprob: f32,
+    /// The most likely alternatives at this position, strongest first, including
+    /// the committed token itself if it was among them.
+    pub top: Vec<(u32, f32)>,
+}
+
+/// `-log p` of `token`, plus the strongest `top` alternatives, from raw logits.
+fn probe(logits: &[f32], token: u32, top: usize) -> TokenProb {
+    let max = logits.iter().fold(f32::NEG_INFINITY, |a, b| a.max(*b));
+    let lse = max + logits.iter().map(|l| (*l - max).exp()).sum::<f32>().ln();
+    let mut best: Vec<(u32, f32)> = Vec::new();
+    if top > 0 {
+        let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+        let k = top.min(idx.len());
+        idx.select_nth_unstable_by(k - 1, |a, b| logits[*b as usize].total_cmp(&logits[*a as usize]));
+        idx.truncate(k);
+        idx.sort_unstable_by(|a, b| logits[*b as usize].total_cmp(&logits[*a as usize]));
+        best = idx.into_iter().map(|i| (i, logits[i as usize] - lse)).collect();
+    }
+    TokenProb { token, logprob: logits.get(token as usize).copied().unwrap_or(f32::NEG_INFINITY) - lse, top: best }
+}
+
 #[derive(Default, Debug)]
 pub struct Outcome {
     pub tokens: usize,
@@ -72,6 +112,8 @@ pub struct Outcome {
     pub drafted: usize,
     pub accepted: usize,
     pub stop: Stop,
+    /// One entry per committed token, when `Plan::logprobs` asked for them.
+    pub logprobs: Vec<TokenProb>,
 }
 
 impl Outcome {
@@ -113,6 +155,9 @@ pub fn generate(
         return out;
     }
 
+    // Snapshot before masking or sampling mutates the row: a reported logprob
+    // must describe the model's own distribution, not the sampler's.
+    let raw = if plan.logprobs > 0 { logits.clone() } else { Vec::new() };
     // Commit the first token from the prefill's own logits.
     if let Some(g) = guide.as_deref_mut() {
         if g.mask(&mut logits) == 0 {
@@ -132,6 +177,9 @@ pub fn generate(
     }
     history.push(pending);
     out.tokens += 1;
+    if plan.logprobs > 0 {
+        out.logprobs.push(probe(&raw, pending, plan.logprobs));
+    }
     if !on_token(pending) {
         out.stop = Stop::Caller;
         return out;
@@ -190,6 +238,10 @@ pub fn generate(
                     }
                     history.push(tok);
                     out.tokens += 1;
+                    if plan.logprobs > 0 {
+                        let judged = &all[(taken - 1) * vocab..taken * vocab];
+                        out.logprobs.push(probe(judged, tok, plan.logprobs));
+                    }
                     if !on_token(tok) {
                         finish = Some(Stop::Caller);
                         break;
@@ -223,10 +275,12 @@ pub fn generate(
             return out;
         }
 
+        let judged = &all[taken * vocab..(taken + 1) * vocab];
+        let raw = if plan.logprobs > 0 { judged.to_vec() } else { Vec::new() };
         let next = match corrected {
             Some(t) => t,
             None => {
-                row.copy_from_slice(&all[taken * vocab..(taken + 1) * vocab]);
+                row.copy_from_slice(judged);
                 if let Some(g) = guide.as_deref_mut() {
                     if g.mask(&mut row) == 0 {
                         out.stop = Stop::Stuck;
@@ -246,6 +300,9 @@ pub fn generate(
         }
         history.push(next);
         out.tokens += 1;
+        if plan.logprobs > 0 {
+            out.logprobs.push(probe(&raw, next, plan.logprobs));
+        }
         if !on_token(next) {
             out.stop = Stop::Caller;
             return out;
