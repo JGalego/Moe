@@ -99,13 +99,56 @@ fn safetensors_index(buf: &[u8], map: usize) -> io::Result<(BTreeMap<String, Rec
 }
 
 impl Store {
-    /// Open a Hugging Face model directory or a packed `.moe` file.
+    /// Open a Hugging Face model directory, a packed `.moe`, or a GGUF file.
+    ///
+    /// A single file is identified by its magic rather than its extension, since
+    /// GGUF checkpoints are named every imaginable way.
     pub fn open(path: &Path) -> io::Result<Store> {
         if path.is_dir() {
-            Store::open_hf(path)
-        } else {
-            Store::open_packed(path)
+            return Store::open_hf(path);
         }
+        let buf = map_file(path)?;
+        if crate::gguf::is_gguf(buf) {
+            Store::open_gguf(path, buf)
+        } else {
+            Store::open_packed(path, buf)
+        }
+    }
+
+    /// Adopt a GGUF file: rename its tensors, reverse its dimensions, and
+    /// synthesise the config and tokenizer the rest of the engine expects.
+    fn open_gguf(file: &Path, buf: &'static [u8]) -> io::Result<Store> {
+        let g = crate::gguf::Gguf::parse(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut index = BTreeMap::new();
+        for t in &g.tensors {
+            // Tensors with no counterpart are ones the engine computes itself.
+            let Some(name) = crate::gguf::rename(&t.name) else { continue };
+            let (slabs, rows, cols) = match t.shape.len() {
+                1 => (1, 1, t.shape[0]),
+                2 => (1, t.shape[0], t.shape[1]),
+                3 => (t.shape[0], t.shape[1], t.shape[2]),
+                _ => continue,
+            };
+            let off = g.data + t.offset;
+            let rec = Rec { map: 0, off, dt: t.dt, slabs, rows, cols };
+            // Refuse a header that points past the file rather than trusting it.
+            if off.checked_add(rec.len()).is_none_or(|end| end > buf.len()) {
+                return err(format!("{}: {} runs past the end of the file", file.display(), t.name));
+            }
+            index.insert(name, rec);
+        }
+        if index.is_empty() {
+            return err(format!("{}: no tensors this engine recognises", file.display()));
+        }
+        Ok(Store {
+            maps: vec![buf],
+            index,
+            config: g.config(),
+            tokenizer: g.tokenizer(),
+            chat_template: g.chat_template(),
+            path: file.into(),
+            packed: true,
+        })
     }
 
     fn open_hf(dir: &Path) -> io::Result<Store> {
@@ -143,8 +186,7 @@ impl Store {
         })
     }
 
-    fn open_packed(file: &Path) -> io::Result<Store> {
-        let buf = map_file(file)?;
+    fn open_packed(file: &Path, buf: &'static [u8]) -> io::Result<Store> {
         if buf.len() < 16 || &buf[..4] != MAGIC {
             return err(format!("{} is not a .moe file", file.display()));
         }

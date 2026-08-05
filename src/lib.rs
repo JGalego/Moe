@@ -23,6 +23,7 @@ pub mod draft;
 pub mod eval;
 pub mod fetch;
 pub mod generate;
+pub mod gguf;
 pub mod grammar;
 pub mod http;
 pub mod model;

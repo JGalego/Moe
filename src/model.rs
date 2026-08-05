@@ -387,9 +387,19 @@ impl Model {
             // Experts come either one tensor at a time or as a fused stack,
             // `gate_up_proj: [E, 2*inter, hidden]` + `down_proj: [E, hidden, inter]`,
             // where gate is the first half of the rows and up the second.
+            // Three layouts exist for the same weights, and which one a
+            // checkpoint uses is visible in the tensors rather than the config:
+            // one fused `[E, 2*inter, hidden]` stack holding gate and up
+            // together; a separate 3-D stack per projection, which is what GGUF
+            // writes; or a tensor per expert. All three address an expert as a row
+            // range, so selecting one stays an offset calculation either way.
             let fused = store.shape(&format!("{p}mlp.experts.gate_up_proj"));
-            let expert = |e: usize, which: usize| match fused {
-                Some((_, gu_rows, _)) => {
+            let names = ["gate_proj", "up_proj", "down_proj"];
+            let stacked =
+                (!names.iter().any(|n| store.shape(&format!("{p}mlp.experts.{n}")).is_none_or(|(e, _, _)| e < 2)))
+                    .then_some(());
+            let expert = |e: usize, which: usize| match (fused, stacked) {
+                (Some((_, gu_rows, _)), _) => {
                     let inter = gu_rows / 2;
                     match which {
                         0 => store.view(&format!("{p}mlp.experts.gate_up_proj"), e, 0..inter),
@@ -399,10 +409,13 @@ impl Model {
                             .and_then(|(_, r, _)| store.view(&format!("{p}mlp.experts.down_proj"), e, 0..r)),
                     }
                 }
-                None => {
-                    let hf = ["gate_proj", "up_proj", "down_proj"][which];
+                (None, Some(())) => {
+                    let n = format!("{p}mlp.experts.{}", names[which]);
+                    store.shape(&n).and_then(|(_, rows, _)| store.view(&n, e, 0..rows))
+                }
+                (None, None) => {
                     let mx = ["w1", "w3", "w2"][which];
-                    g(&format!("mlp.experts.{e}.{hf}.weight"))
+                    g(&format!("mlp.experts.{e}.{}.weight", names[which]))
                         .or_else(|| g(&format!("block_sparse_moe.experts.{e}.{mx}.weight")))
                 }
             };

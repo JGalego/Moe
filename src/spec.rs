@@ -279,10 +279,17 @@ impl Spec {
             }
         };
 
-        // Experts may be one tensor each or a single fused `[E, rows, cols]`
-        // stack; either way the count comes from the checkpoint, not the config.
-        let fused = (0..layers).find_map(|l| store.shape(&format!("{prefix}{l}.mlp.experts.gate_up_proj")));
-        let experts = match fused {
+        // Experts may be one tensor each, a single fused `[E, 2*inter, hidden]`
+        // stack, or one 3-D stack per projection as GGUF writes them. Either way
+        // the count comes from the checkpoint rather than the config, so a
+        // checkpoint whose config disagrees with its weights still loads.
+        let stacked = (0..layers).find_map(|l| {
+            ["mlp.experts.gate_up_proj", "mlp.experts.gate_proj", "mlp.experts.down_proj"]
+                .iter()
+                .find_map(|n| store.shape(&format!("{prefix}{l}.{n}")))
+                .filter(|(e, _, _)| *e > 1)
+        });
+        let experts = match stacked {
             Some((e, _, _)) => e,
             None => (0..)
                 .take_while(|e| {

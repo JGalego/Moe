@@ -11,6 +11,9 @@ use rayon::prelude::*;
 /// Elements per quantisation block. Chosen so a block is one AVX2 register pair.
 pub const BLK: usize = 32;
 
+/// Elements per super-block in the K-quant formats GGUF uses.
+pub const SUPER: usize = 256;
+
 /// Storage format of a weight tensor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dt {
@@ -23,8 +26,14 @@ pub enum Dt {
     Q4,
     /// 6-bit symmetric, f16 scale per 32 values (6.5 bits/weight).
     Q6,
-    /// 5-bit symmetric, f16 scale per 32 values (5.5 bits/weight).
+    /// 5-bit symmetric, f16 scale per 32 values (5.5 bits/weight). Byte-for-byte
+    /// GGUF's `Q5_0`, so such a file is read in place with no conversion.
     Q5,
+    /// GGUF `Q4_K`: 256-value super-blocks, eight 32-value sub-blocks each with a
+    /// 6-bit scale and minimum. Read-only — the engine never writes it.
+    Q4K,
+    /// GGUF `Q6_K`: 256-value super-blocks with 8-bit sub-block scales. Read-only.
+    Q6K,
 }
 
 impl Dt {
@@ -49,6 +58,8 @@ impl Dt {
             Dt::Q8 => "Q8",
             Dt::Q4 => "Q4",
             Dt::Q5 => "Q5",
+            Dt::Q4K => "Q4_K",
+            Dt::Q6K => "Q6_K",
             Dt::Q6 => "Q6",
         }
     }
@@ -61,7 +72,11 @@ impl Dt {
             Dt::Q8 => cols / BLK * (2 + BLK),
             Dt::Q4 => cols / BLK * (2 + BLK / 2),
             // A nibble each, plus one spare bit per value packed 8 to a byte.
-            Dt::Q5 => cols / BLK * (2 + BLK / 2 + BLK / 8),
+            Dt::Q5 => cols / BLK * (2 + BLK / 8 + BLK / 2),
+            // Two f16 scales, twelve packed 6-bit scale/min pairs, then nibbles.
+            Dt::Q4K => cols / SUPER * (2 + 2 + 12 + SUPER / 2),
+            // Nibbles, 2-bit plane, sixteen 8-bit sub-scales, one f16 scale.
+            Dt::Q6K => cols / SUPER * (SUPER / 2 + SUPER / 4 + SUPER / 16 + 2),
             // A nibble each, plus two spare bits per value packed 4 to a byte.
             Dt::Q6 => cols / BLK * (2 + BLK / 2 + BLK / 4),
         }
@@ -71,6 +86,7 @@ impl Dt {
     pub fn fits(self, cols: usize) -> bool {
         match self {
             Dt::Q8 | Dt::Q4 | Dt::Q5 | Dt::Q6 => cols % BLK == 0,
+            Dt::Q4K | Dt::Q6K => cols % SUPER == 0,
             _ => true,
         }
     }
@@ -198,14 +214,69 @@ pub fn dequant(dt: Dt, src: &[u8], out: &mut [f32]) {
         // trailing plane. Sharing the layout means the same indexing reasoning
         // holds for all three.
         Dt::Q5 => {
-            for (blk, o) in src.chunks_exact(2 + BLK / 2 + BLK / 8).zip(out.chunks_mut(BLK)) {
+            for (blk, o) in src.chunks_exact(2 + BLK / 8 + BLK / 2).zip(out.chunks_mut(BLK)) {
                 let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
-                let hi = &blk[2 + BLK / 2..];
+                let (hi, qs) = (&blk[2..2 + BLK / 8], &blk[2 + BLK / 8..]);
                 let bit = |j: usize| ((hi[j / 8] >> (j % 8)) & 1) as i32;
                 for i in 0..BLK / 2 {
-                    let b = blk[2 + i];
+                    let b = qs[i];
                     o[i] = d * (((b & 0x0f) as i32 | (bit(i) << 4)) - 16) as f32;
                     o[i + BLK / 2] = d * (((b >> 4) as i32 | (bit(i + BLK / 2) << 4)) - 16) as f32;
+                }
+            }
+        }
+        // The two K-quant formats, read exactly as llama.cpp writes them. Their
+        // sub-block scales are what buy the accuracy: one scale per 32 values
+        // inside a 256-value super-block, rather than one for the whole thing.
+        Dt::Q4K => {
+            for (blk, o) in src.chunks_exact(16 + SUPER / 2).zip(out.chunks_mut(SUPER)) {
+                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                let dmin = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+                let sc = &blk[4..16];
+                let qs = &blk[16..];
+                // Six-bit scale and minimum per sub-block, packed across 12 bytes.
+                let scale_min = |j: usize| -> (u8, u8) {
+                    if j < 4 {
+                        (sc[j] & 63, sc[j + 4] & 63)
+                    } else {
+                        ((sc[j + 4] & 0x0f) | ((sc[j - 4] >> 6) << 4), (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4))
+                    }
+                };
+                for half in 0..SUPER / 64 {
+                    let (s1, m1) = scale_min(half * 2);
+                    let (s2, m2) = scale_min(half * 2 + 1);
+                    let (d1, off1) = (d * s1 as f32, dmin * m1 as f32);
+                    let (d2, off2) = (d * s2 as f32, dmin * m2 as f32);
+                    let q = &qs[half * 32..(half + 1) * 32];
+                    let y = &mut o[half * 64..(half + 1) * 64];
+                    for l in 0..32 {
+                        y[l] = d1 * (q[l] & 0x0f) as f32 - off1;
+                        y[l + 32] = d2 * (q[l] >> 4) as f32 - off2;
+                    }
+                }
+            }
+        }
+        Dt::Q6K => {
+            for (blk, o) in src.chunks_exact(SUPER / 2 + SUPER / 4 + SUPER / 16 + 2).zip(out.chunks_mut(SUPER)) {
+                let ql = &blk[..SUPER / 2];
+                let qh = &blk[SUPER / 2..SUPER / 2 + SUPER / 4];
+                let sc = &blk[SUPER / 2 + SUPER / 4..SUPER / 2 + SUPER / 4 + SUPER / 16];
+                // The one f16 scale sits at the end of the super-block, after the
+                // sixteen 8-bit sub-block scales.
+                let at = SUPER / 2 + SUPER / 4 + SUPER / 16;
+                let d = f16_to_f32(u16::from_le_bytes([blk[at], blk[at + 1]]));
+                for n in 0..SUPER / 128 {
+                    let (ql, qh, sc) = (&ql[n * 64..], &qh[n * 32..], &sc[n * 8..]);
+                    let y = &mut o[n * 128..(n + 1) * 128];
+                    for l in 0..32 {
+                        let is = l / 16;
+                        let q = |lo: u8, shift: u32| ((lo & 0x0f) as i32 | (((qh[l] >> shift) & 3) as i32) << 4) - 32;
+                        let qhi = |lo: u8, shift: u32| ((lo >> 4) as i32 | (((qh[l] >> shift) & 3) as i32) << 4) - 32;
+                        y[l] = d * (sc[is] as i8) as f32 * q(ql[l], 0) as f32;
+                        y[l + 32] = d * (sc[is + 2] as i8) as f32 * q(ql[l + 32], 2) as f32;
+                        y[l + 64] = d * (sc[is + 4] as i8) as f32 * qhi(ql[l], 4) as f32;
+                        y[l + 96] = d * (sc[is + 6] as i8) as f32 * qhi(ql[l + 32], 6) as f32;
+                    }
                 }
             }
         }
@@ -225,8 +296,14 @@ pub fn dequant(dt: Dt, src: &[u8], out: &mut [f32]) {
 }
 
 /// Pack one f32 row into `dt`. `dst` must be `dt.row_bytes(src.len())` long.
+///
+/// The K-quant formats are read-only: they are here to load GGUF files, and
+/// writing them well needs the sub-block search llama.cpp does at quantisation
+/// time. `Dt::parse` does not accept their names, so this cannot be reached from
+/// a command line — packing a GGUF re-quantises it into one of the engine's own.
 pub fn quantize(dt: Dt, src: &[f32], dst: &mut [u8]) {
     match dt {
+        Dt::Q4K | Dt::Q6K => panic!("{} is read-only; pack to q4, q5, q6 or q8 instead", dt.name()),
         Dt::F32 => {
             for (v, c) in src.iter().zip(dst.chunks_exact_mut(4)) {
                 c.copy_from_slice(&v.to_le_bytes());
@@ -269,7 +346,7 @@ pub fn quantize(dt: Dt, src: &[f32], dst: &mut [u8]) {
             }
         }
         Dt::Q5 => {
-            for (s, blk) in src.chunks_exact(BLK).zip(dst.chunks_exact_mut(2 + BLK / 2 + BLK / 8)) {
+            for (s, blk) in src.chunks_exact(BLK).zip(dst.chunks_exact_mut(2 + BLK / 8 + BLK / 2)) {
                 let amax = s.iter().fold(0f32, |m, v| m.max(v.abs()));
                 // 15 levels either side of zero, so the offset is 16.
                 let d = amax / 15.0;
@@ -279,9 +356,9 @@ pub fn quantize(dt: Dt, src: &[f32], dst: &mut [u8]) {
                 blk[2..].iter_mut().for_each(|b| *b = 0);
                 for i in 0..BLK / 2 {
                     let (lo, hi) = (q(s[i]), q(s[i + BLK / 2]));
-                    blk[2 + i] = (lo & 0x0f) | ((hi & 0x0f) << 4);
+                    blk[2 + BLK / 8 + i] = (lo & 0x0f) | ((hi & 0x0f) << 4);
                     for (j, v) in [(i, lo), (i + BLK / 2, hi)] {
-                        blk[2 + BLK / 2 + j / 8] |= ((v >> 4) & 1) << (j % 8);
+                        blk[2 + j / 8] |= ((v >> 4) & 1) << (j % 8);
                     }
                 }
             }
