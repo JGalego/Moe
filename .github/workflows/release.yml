@@ -68,13 +68,18 @@ jobs:
       # The section the tag names, so the release reads as what was written for
       # it rather than as a list of commits. A tag with no section leaves this
       # empty and the generated notes stand alone.
+      #
+      # Matched on the heading's first two fields, so `## 1.2.3` and
+      # `## 1.2.3 — 2026-01-01` both find their section. Comparing the whole
+      # line silently found nothing the moment a heading carried a date.
       - name: notes
         run: |
           awk -v v="${GITHUB_REF_NAME#v}" '
-            $0 == "## " v { found = 1; next }
+            $1 == "##" && $2 == v { found = 1; next }
             found && /^## / { exit }
             found { print }
           ' CHANGELOG.md > notes.md
+          test -s notes.md || echo "no CHANGELOG section for ${GITHUB_REF_NAME}" >&2
       - uses: softprops/action-gh-release@v2
         with:
           body_path: notes.md
