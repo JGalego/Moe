@@ -51,3 +51,69 @@ jobs:
       # The reference implementation must keep running; its logits are not
       # diffed because libm rounding differs across platforms.
       - run: python3 scripts/oracle.py "$RUNNER_TEMP/fixtures"
+
+  # A kernel regression does not fail a test — it just makes everything slow, and
+  # nobody notices for a release. This catches the catastrophic kind: work that
+  # should happen once per weight row happening once per token, say. The floors
+  # are deliberately far below what the runner actually manages, because a shared
+  # runner's timings are noisy and a flaky perf gate gets ignored.
+  perf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: decode and prefill throughput
+        run: |
+          set -euo pipefail
+          out=$(./target/release/moe bench tests/fixtures/gqa --prompt-len 64 --tokens 32)
+          echo "$out"
+          prefill=$(echo "$out" | sed -n 's/.*prefill .* \([0-9.]*\) tok\/s.*/\1/p')
+          decode=$(echo "$out" | sed -n 's/.*decode .* \([0-9.]*\) tok\/s.*/\1/p')
+          echo "prefill=$prefill decode=$decode"
+          awk -v v="$prefill" 'BEGIN { exit (v+0 > 200) ? 0 : 1 }' \
+            || { echo "prefill collapsed to $prefill tok/s"; exit 1; }
+          awk -v v="$decode" 'BEGIN { exit (v+0 > 100) ? 0 : 1 }' \
+            || { echo "decode collapsed to $decode tok/s"; exit 1; }
+      - name: speculation must save forward steps
+        run: |
+          set -euo pipefail
+          ids=$(python3 -c "print(','.join(['1','4','7','10','13','16'] * 5))")
+          out=$(./target/release/moe run tests/fixtures/gqa --ids "$ids" -n 20 \
+                  --no-stream --draft 6 2>&1)
+          echo "$out"
+          # On input this repetitive the drafter must land above one token per step.
+          rate=$(echo "$out" | sed -n 's/.*| \([0-9.]*\) tokens per forward step.*/\1/p')
+          echo "tokens per step = $rate"
+          awk -v v="$rate" 'BEGIN { exit (v+0 > 1.2) ? 0 : 1 }' \
+            || { echo "speculation stopped paying off: $rate tokens per step"; exit 1; }
+
+  # The fuzz targets need nightly, so they are not part of `cargo test`. Building
+  # them keeps them from rotting silently against an API change.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo +nightly fuzz build
+      # A short run on each target, so a crash reachable in seconds is caught here
+      # rather than by whoever downloads a bad checkpoint.
+      - run: |
+          for t in gguf tokenizer grammar template store; do
+            echo "== $t"
+            cargo +nightly fuzz run "$t" -- -max_total_time=30 -rss_limit_mb=4096
+          done
+
+  # The container is part of the "one binary, no dependencies" claim, so it has to
+  # keep building and the binary inside it has to run.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t moe:ci .
+      - run: docker run --rm moe:ci --version
+      - run: |
+          docker run --rm -v "$PWD/tests/fixtures/gqa:/m:ro" moe:ci info /m
