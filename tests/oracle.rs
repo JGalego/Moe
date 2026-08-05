@@ -222,6 +222,80 @@ fn qk_norm_across_the_whole_projection_matches_reference() {
     check_batched("gqa_fullnorm");
 }
 
+/// YaRN scaling and a sliding window on one layer but not the other, both
+/// against the reference. Getting either wrong is the failure mode that looks
+/// fine for a few hundred tokens and then quietly degrades, so it is checked the
+/// same way everything else is rather than reasoned about.
+#[test]
+fn stretched_rope_and_local_attention_match_reference() {
+    check_incremental("gqa_long");
+    check_batched("gqa_long");
+    check_forward_all("gqa_long");
+
+    // And the spec must have read both out of the config.
+    let m = load(&fixture("gqa_long").dir);
+    assert_eq!(m.spec.rope.kind, moe::spec::RopeKind::Yarn);
+    assert!(m.spec.rope.attn_scale() > 1.0, "YaRN must raise the attention scale");
+    assert_eq!(m.spec.windows, vec![Some(3), None], "one local layer, one global");
+    assert!(m.spec.summary().contains("Yarn"));
+    assert!(m.spec.summary().contains("window"));
+}
+
+/// A window at least as wide as the context reaches everything, so it must give
+/// exactly what no window gives. This pins the boundary arithmetic — an
+/// off-by-one there is invisible in ordinary output.
+#[test]
+fn a_window_wider_than_the_context_is_no_window() {
+    let f = fixture("gqa");
+    let store = Store::open(&f.dir).unwrap();
+    let mut spec = moe::Spec::derive(&store).unwrap();
+    spec.windows = vec![Some(1024); spec.layers];
+    let windowed = Model::load_with(Store::open(&f.dir).unwrap(), spec).unwrap();
+    let plain = load(&f.dir);
+
+    let mut a = State::new(&windowed, 32);
+    let mut b = State::new(&plain, 32);
+    for tok in &f.tokens {
+        let x = windowed.forward(&[*tok], &mut a);
+        let y = plain.forward(&[*tok], &mut b);
+        assert!(max_abs_diff(&x, &y) < 1e-6, "a window past the context changed the result");
+    }
+}
+
+/// With a window of one, no information can cross positions: every layer attends
+/// only to the token it is at. So the logits at a position must not depend on
+/// what came before it — which is a property of windowing that no amount of
+/// matching a reference would establish.
+#[test]
+fn a_window_of_one_isolates_every_position() {
+    let f = fixture("gqa");
+    let build = || {
+        let store = Store::open(&f.dir).unwrap();
+        let mut spec = moe::Spec::derive(&store).unwrap();
+        spec.windows = vec![Some(1); spec.layers];
+        Model::load_with(store, spec).unwrap()
+    };
+    let m = build();
+    let last = *f.tokens.last().unwrap();
+
+    let mut a = State::new(&m, 32);
+    for tok in &f.tokens[..f.tokens.len() - 1] {
+        m.forward(&[*tok], &mut a);
+    }
+    let after_history = m.forward(&[last], &mut a);
+
+    // Same token, same position, completely different prefix.
+    let mut b = State::new(&m, 32);
+    for _ in 0..f.tokens.len() - 1 {
+        m.forward(&[0], &mut b);
+    }
+    let after_other = m.forward(&[last], &mut b);
+
+    assert_eq!(a.pos, b.pos);
+    let d = max_abs_diff(&after_history, &after_other);
+    assert!(d < 1e-5, "a window of one still leaked earlier context: max |diff| = {d}");
+}
+
 #[test]
 fn gqa_batched_prefill_matches_reference() {
     check_batched("gqa");

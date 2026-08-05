@@ -61,16 +61,98 @@ def sigmoid(v):
     return 1.0 / (1.0 + math.exp(-v))
 
 
-def rope(x, pos, theta, scale):
+def rope(x, pos, inv):
     half = len(x) // 2
     out = list(x)
     for i in range(half):
-        freq = theta ** (-2.0 * i / len(x))
-        a = pos * freq / scale
+        a = pos * inv[i]
         c, s = math.cos(a), math.sin(a)
         out[i] = x[i] * c - x[i + half] * s
         out[i + half] = x[i] * s + x[i + half] * c
     return out
+
+
+def inv_freqs(cfg, dim):
+    """Inverse rotary frequencies, written from the scaling papers.
+
+    Position interpolation divides the frequencies; NTK raises the base instead;
+    Llama 3 does it piecewise by wavelength; YaRN ramps between interpolation and
+    extrapolation across the frequency band whose wavelengths bracket the trained
+    context. Each is stated here directly rather than derived from the engine.
+    """
+    theta = cfg["rope_theta"]
+    base = [theta ** (-2.0 * i / dim) for i in range(dim // 2)]
+    sc = cfg.get("rope_scaling") or {}
+    kind = sc.get("rope_type", sc.get("type", ""))
+    s = sc.get("factor", 1.0)
+    if not kind or s <= 1.0:
+        return base
+    ctx = sc.get("original_max_position_embeddings", cfg["max_position_embeddings"])
+
+    if kind == "linear":
+        return [f / s for f in base]
+    if kind in ("dynamic", "ntk"):
+        t2 = theta * s ** (dim / (dim - 2))
+        return [t2 ** (-2.0 * i / dim) for i in range(dim // 2)]
+    if kind == "llama3":
+        lof, hif = sc.get("low_freq_factor", 1.0), sc.get("high_freq_factor", 4.0)
+        lo_wave, hi_wave = ctx / lof, ctx / hif
+        out = []
+        for f in base:
+            wave = 2 * math.pi / f
+            if wave > lo_wave:
+                out.append(f / s)
+            elif wave < hi_wave:
+                out.append(f)
+            else:
+                t = (ctx / wave - lof) / (hif - lof)
+                out.append((1 - t) * f / s + t * f)
+        return out
+    if kind == "yarn":
+        bf, bs = sc.get("beta_fast", 32.0), sc.get("beta_slow", 1.0)
+        ln_base = math.log(theta)
+        bound = lambda b: dim * math.log(ctx / (b * 2 * math.pi)) / (2 * ln_base)
+        low, high = math.floor(bound(bf)), math.ceil(bound(bs))
+        span = max(high - low, 1e-3)
+        out = []
+        for i, f in enumerate(base):
+            ramp = min(1.0, max(0.0, (i - low) / span))
+            out.append((1 - ramp) * (f / s) + ramp * f)
+        return out
+    return base
+
+
+def attn_scale(cfg):
+    """YaRN's correction to the attention scale; 1.0 for everything else."""
+    sc = cfg.get("rope_scaling") or {}
+    if sc.get("rope_type", sc.get("type", "")) != "yarn":
+        return 1.0
+    s = sc.get("factor", 1.0)
+    if s <= 1.0:
+        return 1.0
+    g = lambda m: 0.1 * m * math.log(s) + 1.0
+    ms, msa = sc.get("mscale", 0.0), sc.get("mscale_all_dim", 0.0)
+    if ms or msa:
+        return g(ms) / max(g(msa), 1e-6) * sc.get("attention_factor", 1.0)
+    return g(1.0) * sc.get("attention_factor", 1.0)
+
+
+def windows(cfg, layers):
+    """Attention window per layer, across the four config conventions."""
+    w = cfg.get("sliding_window") or 0
+    if not w:
+        return [None] * layers
+    types = cfg.get("layer_types")
+    if types:
+        local = ("sliding_attention", "local_attention")
+        return [w if (types[l] if l < len(types) else "") in local else None for l in range(layers)]
+    pat = cfg.get("sliding_window_pattern", 0)
+    if pat and pat > 1:
+        return [None if (l + 1) % pat == 0 else w for l in range(layers)]
+    if cfg.get("use_sliding_window") is False:
+        return [None] * layers
+    frm = cfg.get("max_window_layers", 0)
+    return [w if l >= frm else None for l in range(layers)]
 
 
 def mlp(w, prefix, x):
@@ -82,12 +164,16 @@ def mlp(w, prefix, x):
 # ---------------------------------------------------------------- fixtures
 
 
-def build_gqa(rng, full_norm=False):
+def build_gqa(rng, full_norm=False, long=False):
     """Grouped-query attention, qk-norm, softmax routing, no dense layers.
 
     `full_norm` switches qk-norm from one weight per head (Qwen3-style) to one
     across the whole projection (OLMoE-style). Only the weight's width says
     which is meant, so both have to be exercised.
+
+    `long` adds the two things a stretched context needs: YaRN rope scaling, and
+    a sliding window on one layer but not the other, so a checkpoint that mixes
+    local and global attention is covered.
     """
     cfg = dict(
         architectures=["MoeForCausalLM"],
@@ -107,6 +193,14 @@ def build_gqa(rng, full_norm=False):
         norm_topk_prob=True,
         tie_word_embeddings=False,
     )
+    if long:
+        cfg["rope_scaling"] = dict(
+            rope_type="yarn", factor=4.0, original_max_position_embeddings=32,
+            beta_fast=32.0, beta_slow=1.0,
+        )
+        cfg["max_position_embeddings"] = 128
+        cfg["sliding_window"] = 3
+        cfg["layer_types"] = ["sliding_attention", "full_attention"]
     h, v = cfg["hidden_size"], cfg["vocab_size"]
     hd, nh, nkv = cfg["head_dim"], cfg["num_attention_heads"], cfg["num_key_value_heads"]
     w = {
@@ -237,9 +331,13 @@ def route(cfg, w, p, x, experts):
 
 def forward(cfg, w, tokens):
     """Returns logits after each prefix of `tokens`."""
-    eps, theta = cfg["rms_norm_eps"], cfg["rope_theta"]
+    eps = cfg["rms_norm_eps"]
     h, nh = cfg["hidden_size"], cfg["num_attention_heads"]
     is_mla = "kv_lora_rank" in cfg
+    rot = cfg["qk_rope_head_dim"] if is_mla else cfg["head_dim"]
+    inv = inv_freqs(cfg, rot)
+    ascale = attn_scale(cfg)
+    wins = windows(cfg, cfg["num_hidden_layers"])
     experts = cfg.get("num_experts", cfg.get("n_routed_experts", 0))
     cache = [([], []) for _ in range(cfg["num_hidden_layers"])]
     out = []
@@ -258,12 +356,12 @@ def forward(cfg, w, tokens):
                 qflat = matvec(w[p + "self_attn.q_b_proj.weight"], c)
                 ca = matvec(w[p + "self_attn.kv_a_proj_with_mqa.weight"], n)
                 c_kv = rmsnorm(ca[:kvl], w[p + "self_attn.kv_a_layernorm.weight"], eps)
-                k_pe = rope(ca[kvl:], pos, theta, 1.0)
+                k_pe = rope(ca[kvl:], pos, inv)
                 kv = matvec(w[p + "self_attn.kv_b_proj.weight"], c_kv)
                 qs, ks, vs = [], [], []
                 for hi in range(nh):
                     qh = qflat[hi * (qk_n + qk_r):(hi + 1) * (qk_n + qk_r)]
-                    qs.append(qh[:qk_n] + rope(qh[qk_n:], pos, theta, 1.0))
+                    qs.append(qh[:qk_n] + rope(qh[qk_n:], pos, inv))
                     src = kv[hi * (qk_n + vh):(hi + 1) * (qk_n + vh)]
                     ks.append(src[:qk_n] + k_pe)
                     vs.append(src[qk_n:])
@@ -286,12 +384,12 @@ def forward(cfg, w, tokens):
                     qh = qflat[hi * hd:(hi + 1) * hd]
                     if qn:
                         qh = rmsnorm(qh, qn, eps)
-                    qs.append(rope(qh, pos, theta, 1.0))
+                    qs.append(rope(qh, pos, inv))
                 for hi in range(nkv):
                     kh = kflat[hi * hd:(hi + 1) * hd]
                     if kn:
                         kh = rmsnorm(kh, kn, eps)
-                    ks.append(rope(kh, pos, theta, 1.0))
+                    ks.append(rope(kh, pos, inv))
                     vs.append(vflat[hi * hd:(hi + 1) * hd])
                 qd, vd = hd, hd
 
@@ -299,17 +397,18 @@ def forward(cfg, w, tokens):
             cache[l][1].append(vs)
             rep = nh // nkv
             ctx = []
+            lo = max(0, pos + 1 - wins[l]) if wins[l] else 0
             for hi in range(nh):
                 kvh = hi // rep
                 scores = [
-                    sum(a * b for a, b in zip(qs[hi], cache[l][0][j][kvh])) / math.sqrt(qd)
-                    for j in range(pos + 1)
+                    sum(a * b for a, b in zip(qs[hi], cache[l][0][j][kvh])) * ascale / math.sqrt(qd)
+                    for j in range(lo, pos + 1)
                 ]
                 scores = softmax(scores)
                 acc = [0.0] * vd
-                for j, s in enumerate(scores):
+                for k, s in enumerate(scores):
                     for d in range(vd):
-                        acc[d] += s * cache[l][1][j][kvh][d]
+                        acc[d] += s * cache[l][1][lo + k][kvh][d]
                 ctx += acc
             x = [a + b for a, b in zip(x, matvec(w[p + "self_attn.o_proj.weight"], ctx))]
 
@@ -358,6 +457,7 @@ def main():
     builders = (
         ("gqa", build_gqa),
         ("gqa_fullnorm", lambda rng: build_gqa(rng, full_norm=True)),
+        ("gqa_long", lambda rng: build_gqa(rng, long=True)),
         ("mla", build_mla),
     )
     for name, build in builders:

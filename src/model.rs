@@ -196,6 +196,9 @@ pub struct Model {
     /// probably want. Free when the weights are already resident, and the
     /// difference between streaming and stalling when they are not.
     pub prefetch: bool,
+    /// Inverse rotary frequencies, one per rotated pair, with any context
+    /// extension already folded in.
+    inv_freq: Vec<f32>,
     embed: QT,
     out_norm: Vec<f32>,
     lm_head: QT,
@@ -222,11 +225,14 @@ fn softmax(x: &mut [f32]) {
 }
 
 /// Rotary embedding, half-split (the layout Hugging Face checkpoints use).
-fn rope(x: &mut [f32], pos: usize, theta: f32, scale: f32) {
+///
+/// `inv` holds one inverse frequency per rotated pair, resolved once at load —
+/// which is also where every context-extension scheme has already been applied,
+/// so the hot loop knows nothing about them.
+fn rope(x: &mut [f32], pos: usize, inv: &[f32]) {
     let half = x.len() / 2;
-    let p = pos as f32 / scale;
-    for i in 0..half {
-        let freq = theta.powf(-2.0 * i as f32 / x.len() as f32);
+    let p = pos as f32;
+    for (i, freq) in inv.iter().enumerate().take(half) {
         let (s, c) = (p * freq).sin_cos();
         let (a, b) = (x[i], x[i + half]);
         x[i] = a * c - b * s;
@@ -343,7 +349,8 @@ impl Model {
                 ffn,
             });
         }
-        Ok(Model { spec, store, prefetch: true, embed, out_norm, lm_head, layers })
+        let inv_freq = spec.rope.inv_freqs(spec.head_dim);
+        Ok(Model { spec, store, prefetch: true, inv_freq, embed, out_norm, lm_head, layers })
     }
 
     /// The weight blocks one expert occupies, in the order the forward pass
@@ -549,7 +556,7 @@ impl Model {
                             }
                         }
                         for hh in row.chunks_mut(qd) {
-                            rope(hh, p, s.theta, s.rope_scale);
+                            rope(hh, p, &self.inv_freq);
                         }
                     }
                     st.k[li][p * kd..(p + 1) * kd].copy_from_slice(&k[i * kd..(i + 1) * kd]);
@@ -595,10 +602,10 @@ impl Model {
                 for i in 0..t {
                     let p = base + i;
                     let mut k_pe = c[i * ca + m.kv_lora..(i + 1) * ca].to_vec();
-                    rope(&mut k_pe, p, s.theta, s.rope_scale);
+                    rope(&mut k_pe, p, &self.inv_freq);
                     for hi in 0..s.heads {
                         let qh = &mut q[i * s.heads * qd + hi * qd..i * s.heads * qd + (hi + 1) * qd];
-                        rope(&mut qh[m.qk_nope..], p, s.theta, s.rope_scale);
+                        rope(&mut qh[m.qk_nope..], p, &self.inv_freq);
                         let src = &kv[i * s.heads * kvw + hi * kvw..i * s.heads * kvw + (hi + 1) * kvw];
                         let kdst = &mut st.k[li][p * kd + hi * qd..p * kd + (hi + 1) * qd];
                         kdst[..m.qk_nope].copy_from_slice(&src[..m.qk_nope]);
@@ -611,24 +618,34 @@ impl Model {
 
         // Causal scaled dot-product attention, one task per (token, head).
         let (kd, vdim) = (n_kv * qd, n_kv * vd);
-        let scale = 1.0 / (qd as f32).sqrt();
+        // YaRN raises the attention scale to compensate for the entropy a
+        // stretched rotation adds; every other scheme leaves it at 1.
+        let scale = s.rope.attn_scale() / (qd as f32).sqrt();
         let rep = s.heads / n_kv.max(1);
         let heads = s.heads;
+        // A local layer attends to the last `window` positions only, itself
+        // included, so the work per token stops growing with the context.
+        let window = s.windows.get(li).copied().flatten().map(|w| w as usize);
         let ctx: Vec<f32> = (0..t * heads)
             .into_par_iter()
             .flat_map_iter(|idx| {
                 let (i, hi) = (idx / heads, idx % heads);
                 let p = base + i;
+                let lo = match window {
+                    Some(w) => (p + 1).saturating_sub(w),
+                    None => 0,
+                };
                 let kv_h = if rep > 1 { hi / rep } else { hi.min(n_kv - 1) };
                 let qv = &q[i * heads * qd + hi * qd..i * heads * qd + (hi + 1) * qd];
-                let mut scores = Vec::with_capacity(p + 1);
-                for j in 0..=p {
+                let mut scores = Vec::with_capacity(p + 1 - lo);
+                for j in lo..=p {
                     let kj = &st.k[li][j * kd + kv_h * qd..j * kd + (kv_h + 1) * qd];
                     scores.push(crate::quant::dot(qv, kj) * scale);
                 }
                 softmax(&mut scores);
                 let mut acc = vec![0.0f32; vd];
-                for (j, w) in scores.iter().enumerate() {
+                for (k, w) in scores.iter().enumerate() {
+                    let j = lo + k;
                     let vj = &st.v[li][j * vdim + kv_h * vd..j * vdim + (kv_h + 1) * vd];
                     for (a, b) in acc.iter_mut().zip(vj) {
                         *a += w * b;
