@@ -305,6 +305,67 @@ impl Store {
     }
 }
 
+/// Round a byte range out to page boundaries, as the memory syscalls require.
+#[cfg(unix)]
+fn pages(bytes: &[u8]) -> Option<(*mut libc::c_void, usize)> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let page = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(1) as usize;
+    let start = bytes.as_ptr() as usize;
+    let aligned = start & !(page - 1);
+    Some((aligned as *mut libc::c_void, bytes.len() + (start - aligned)))
+}
+
+/// Ask the kernel to fetch a byte range in the background.
+///
+/// This is advice, not a read: it returns before the pages arrive, so they land
+/// while the caller is busy elsewhere. Advice that turns out to be wrong costs
+/// nothing but some page cache — which is what makes guessing at which experts a
+/// token will choose safe in a way guessing at its output is not.
+#[cfg(unix)]
+pub fn advise(bytes: &[u8]) {
+    if let Some((addr, len)) = pages(bytes) {
+        // Deliberately unchecked: failure means the pages arrive later, which is
+        // exactly what would have happened without asking.
+        unsafe { libc::madvise(addr, len, libc::MADV_WILLNEED) };
+    }
+}
+
+/// Keep a byte range resident, so it can never be evicted.
+#[cfg(unix)]
+pub fn lock(bytes: &[u8]) -> io::Result<()> {
+    match pages(bytes) {
+        None => Ok(()),
+        Some((addr, len)) => match unsafe { libc::mlock(addr, len) } {
+            0 => Ok(()),
+            _ => Err(io::Error::last_os_error()),
+        },
+    }
+}
+
+/// Windows and the rest have no portable equivalent worth the linkage; the
+/// engine simply does not prefetch there, and correctness never depended on it.
+#[cfg(not(unix))]
+pub fn advise(_bytes: &[u8]) {}
+
+#[cfg(not(unix))]
+pub fn lock(_bytes: &[u8]) -> io::Result<()> {
+    Err(io::Error::other("locking pages is not supported on this platform"))
+}
+
+/// Fault a range in by reading one byte per page. Slower than [`advise`] because
+/// it blocks, but it works everywhere and needs no privilege, which makes it the
+/// fallback when [`lock`] is refused.
+pub fn touch(bytes: &[u8]) -> u64 {
+    let mut sink = 0u64;
+    for i in (0..bytes.len()).step_by(4096) {
+        sink = sink.wrapping_add(unsafe { std::ptr::read_volatile(&bytes[i]) } as u64);
+    }
+    std::hint::black_box(sink);
+    bytes.len() as u64
+}
+
 /// Expert weights: the bulk of a sparse model and the only tensors read on a
 /// per-token, per-route basis.
 pub fn is_expert(name: &str) -> bool {

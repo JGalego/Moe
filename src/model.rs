@@ -121,6 +121,8 @@ pub struct Stats {
     pub reused: AtomicU64,
     /// Expert weight bytes touched.
     pub expert_bytes: AtomicU64,
+    /// Expert weight bytes the kernel was asked to fetch ahead of time.
+    pub prefetched: AtomicU64,
 }
 
 impl Stats {
@@ -165,6 +167,12 @@ impl State {
         self.truncate(0);
     }
 
+    /// Experts the previous token selected at `layer`. Empty for a dense layer,
+    /// or immediately after a truncation.
+    pub fn previous(&self, layer: usize) -> &[u32] {
+        self.prev.get(layer).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
     /// Drop everything cached at or after position `n`, keeping the prefix.
     ///
     /// The KV cache is append-only per position, so later positions are simply
@@ -184,6 +192,10 @@ impl State {
 pub struct Model {
     pub spec: Spec,
     pub store: Store,
+    /// Whether to advise the kernel about the experts a decode step will
+    /// probably want. Free when the weights are already resident, and the
+    /// difference between streaming and stalling when they are not.
+    pub prefetch: bool,
     embed: QT,
     out_norm: Vec<f32>,
     lm_head: QT,
@@ -331,7 +343,70 @@ impl Model {
                 ffn,
             });
         }
-        Ok(Model { spec, store, embed, out_norm, lm_head, layers })
+        Ok(Model { spec, store, prefetch: true, embed, out_norm, lm_head, layers })
+    }
+
+    /// The weight blocks one expert occupies, in the order the forward pass
+    /// reads them.
+    fn expert_data(&self, layer: usize, expert: usize) -> Option<[&'static [u8]; 3]> {
+        match &self.layers.get(layer)?.ffn {
+            Ffn::Moe { experts, .. } => {
+                let e = experts.get(expert)?;
+                Some([e.gate.data, e.up.data, e.down.data])
+            }
+            Ffn::Dense(_) => None,
+        }
+    }
+
+    /// Advise the kernel to fetch the experts the previous token chose.
+    ///
+    /// Expert selection is strongly correlated between adjacent tokens — the
+    /// engine already measures how strongly, and reports it as the reuse rate —
+    /// so the last token's choice is a good guess at this one's. The advice for
+    /// every layer is issued together, before layer 0 runs, so the reads overlap
+    /// the whole forward pass instead of stalling the layer that needs them.
+    /// A wrong guess wastes some page cache and nothing else.
+    ///
+    /// Returns the bytes advised, which is what `--stats` reports.
+    pub fn prefetch_next(&self, st: &State) -> u64 {
+        let mut bytes = 0u64;
+        for layer in 0..self.layers.len() {
+            for e in st.previous(layer) {
+                if let Some(blocks) = self.expert_data(layer, *e as usize) {
+                    for b in blocks {
+                        crate::store::advise(b);
+                        bytes += b.len() as u64;
+                    }
+                }
+            }
+        }
+        bytes
+    }
+
+    /// Keep the hottest experts resident, in the order given, up to `budget`
+    /// bytes. Pair it with a trace: `moe route` says which experts a workload
+    /// actually uses, and routing is skewed enough that a small pinned set
+    /// covers most tokens.
+    ///
+    /// Returns `(bytes locked, bytes merely faulted in)`. Locking needs
+    /// `RLIMIT_MEMLOCK` headroom, so when the kernel refuses the range is read
+    /// instead — which still leaves it in the page cache, just evictably.
+    pub fn pin_experts(&self, hot: &[(u32, u32)], budget: u64) -> (u64, u64) {
+        let (mut locked, mut touched) = (0u64, 0u64);
+        for (layer, expert) in hot {
+            let Some(blocks) = self.expert_data(*layer as usize, *expert as usize) else { continue };
+            let size: u64 = blocks.iter().map(|b| b.len() as u64).sum();
+            if locked + touched + size > budget {
+                break;
+            }
+            for b in blocks {
+                match crate::store::lock(b) {
+                    Ok(()) => locked += b.len() as u64,
+                    Err(_) => touched += crate::store::touch(b),
+                }
+            }
+        }
+        (locked, touched)
     }
 
     /// (key dim, value dim) held per cached position, summed over heads.
@@ -398,6 +473,12 @@ impl Model {
 
         if let Some(tr) = st.trace.as_mut() {
             tr.tokens.extend_from_slice(tokens);
+        }
+
+        // Only worth it while decoding: a prefill batch already touches most of
+        // the experts, so there is nothing to guess at.
+        if self.prefetch && t == 1 && s.experts > 0 {
+            st.stats.prefetched.fetch_add(self.prefetch_next(st), Ordering::Relaxed);
         }
 
         let mut x = vec![0.0f32; t * h];

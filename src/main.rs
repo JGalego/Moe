@@ -47,6 +47,9 @@ RUN OPTIONS
       --draft-ngram N       longest suffix the drafter matches         [8]
       --json                emit only valid JSON, enforced while decoding
       --schema PATH         emit only JSON matching this JSON Schema
+      --no-prefetch         stop advising the kernel about the next step's experts
+      --pin TRACE.jsonl     keep the experts that trace used resident
+      --pin-budget GB       how much to keep resident                  [2]
 
 SERVE OPTIONS
       --port N              listen port                   [8080]
@@ -56,6 +59,8 @@ SERVE OPTIONS
       --max-queue N         requests allowed to wait before 503     [32]
       --no-prefix-cache     re-prefill every request instead of reusing the cache
       --draft N             speculate N tokens per step, 0 = off       [0]
+      --no-prefetch         stop advising the kernel about the next step's experts
+      --pin TRACE.jsonl     keep the experts that trace used resident
       --cors                allow browser origins
 
 ROUTE OPTIONS
@@ -117,7 +122,15 @@ impl Args {
                 .to_string();
                 let flag = matches!(
                     key.as_str(),
-                    "help" | "no-stream" | "stats" | "version" | "offline" | "cors" | "no-prefix-cache" | "json"
+                    "help"
+                        | "no-stream"
+                        | "stats"
+                        | "version"
+                        | "offline"
+                        | "cors"
+                        | "no-prefix-cache"
+                        | "json"
+                        | "no-prefetch"
                 );
                 let val = match inline {
                     Some(v) => v,
@@ -303,6 +316,31 @@ fn prompt_ids(args: &Args, tok: Option<&Tokenizer>, bos: Option<u32>) -> Vec<u32
     }
 }
 
+/// Keep the experts a recorded trace used resident, if `--pin` names one.
+///
+/// This is where `moe route` pays off twice: the trace that showed which experts
+/// a workload reaches is also the list worth holding in memory.
+fn pin(args: &Args, m: &Model) {
+    let Some(trace) = args.get("pin") else { return };
+    let counts = moe::Counts::read(Path::new(trace)).unwrap_or_else(|e| fail(format!("{trace}: {e}")));
+    if counts.is_empty() {
+        fail(format!("{trace}: no routing records to pin"));
+    }
+    let budget = (args.num("pin-budget", 2.0f64) * 1e9) as u64;
+    let hot = counts.hottest();
+    let t = Instant::now();
+    let (locked, touched) = m.pin_experts(&hot, budget);
+    eprintln!(
+        "pinned {} of {} resident from {} hot experts in {:.1}s ({} locked, {} faulted in)",
+        human(locked + touched),
+        human(budget),
+        hot.len(),
+        t.elapsed().as_secs_f32(),
+        human(locked),
+        human(touched),
+    );
+}
+
 /// The shape `--json` or `--schema` asks the output to have.
 fn shape_of(args: &Args) -> Option<moe::Grammar> {
     if let Some(path) = args.get("schema") {
@@ -324,7 +362,9 @@ fn prefill(m: &Model, ids: &[u32], st: &mut State) -> Vec<f32> {
 
 fn run(args: &Args, path: &Path) {
     let t_load = Instant::now();
-    let m = load(path);
+    let mut m = load(path);
+    m.prefetch = !args.on("no-prefetch");
+    pin(args, &m);
     let tok = tokenizer_for(args, path, Some(&m.store));
     let ids = prompt_ids(args, tok.as_ref(), m.spec.bos);
     if ids.is_empty() {
@@ -430,17 +470,20 @@ fn run(args: &Args, path: &Path) {
     }
     if args.on("stats") {
         eprintln!(
-            "experts activated {} | repeated previous token's choice {:.0}% | expert bytes touched {} | kv cache {}",
+            "experts activated {} | repeated previous token's choice {:.0}% | expert bytes touched {} | prefetched {} | kv cache {}",
             st.stats.routed.load(std::sync::atomic::Ordering::Relaxed),
             100.0 * st.stats.reuse_rate(),
             human(st.stats.expert_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+            human(st.stats.prefetched.load(std::sync::atomic::Ordering::Relaxed)),
             human(st.kv_bytes()),
         );
     }
 }
 
 fn serve(args: &Args, path: &Path, spec: &str) {
-    let m = load(path);
+    let mut m = load(path);
+    m.prefetch = !args.on("no-prefetch");
+    pin(args, &m);
     let tok = tokenizer_for(args, path, Some(&m.store));
     let chat = match args.get("chat-format") {
         Some(name) => Some(

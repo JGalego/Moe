@@ -162,6 +162,17 @@ impl Counts {
         self.counts.values().filter(|n| **n > 0).count() as f32 / (layers * self.experts) as f32
     }
 
+    /// Every `(layer, expert)` this trace touched, busiest first.
+    ///
+    /// Routing is skewed, so the head of this list is where a residency budget
+    /// buys the most: pinning it keeps the experts a workload actually uses out
+    /// of the way of eviction.
+    pub fn hottest(&self) -> Vec<(u32, u32)> {
+        let mut v: Vec<(&(u32, u32), &u64)> = self.counts.iter().filter(|(_, n)| **n > 0).collect();
+        v.sort_unstable_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        v.into_iter().map(|(k, _)| *k).collect()
+    }
+
     /// Strongest `n` experts in a layer, share-descending.
     pub fn top(&self, layer: u32, n: usize) -> Vec<(u32, f32)> {
         let mut v: Vec<(u32, f32)> =

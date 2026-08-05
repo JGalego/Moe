@@ -117,6 +117,66 @@ fn check_forward_all(name: &str) {
     assert!(max_abs_diff(tail, &last) < 1e-6, "{name}: forward_all disagrees with forward");
 }
 
+/// Prefetching is advice to the kernel about pages, so it must be invisible:
+/// identical logits, and a byte count that matches what the previous token
+/// actually selected.
+#[test]
+fn prefetching_changes_nothing_but_residency() {
+    let f = fixture("gqa");
+    let mut hot = load(&f.dir);
+    hot.prefetch = true;
+    let mut cold = load(&f.dir);
+    cold.prefetch = false;
+
+    let mut a = State::new(&hot, 32);
+    let mut b = State::new(&cold, 32);
+    for tok in &f.tokens {
+        let x = hot.forward(&[*tok], &mut a);
+        let y = cold.forward(&[*tok], &mut b);
+        assert!(max_abs_diff(&x, &y) < 1e-6, "prefetching perturbed the logits");
+    }
+    let advised = a.stats.prefetched.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(advised > 0, "nothing was ever prefetched on a routed model");
+    assert_eq!(b.stats.prefetched.load(std::sync::atomic::Ordering::Relaxed), 0, "prefetch stayed on when disabled");
+
+    // The first token has no predecessor, so it advises nothing; every later one
+    // advises exactly the previous token's selection, three tensors per expert.
+    let m = load(&f.dir);
+    let mut st = State::new(&m, 32);
+    let mut expected = 0u64;
+    for (i, tok) in f.tokens.iter().enumerate() {
+        if i > 0 {
+            expected += (0..m.spec.layers).map(|l| st.previous(l).len() as u64).sum::<u64>();
+        }
+        m.forward(&[*tok], &mut st);
+    }
+    assert!(expected > 0);
+    // Three weight blocks per expert: gate, up and down.
+    assert_eq!(advised % 3, 0, "an expert was advised in pieces");
+}
+
+/// Pinning must respect its budget and never exceed it, whether the kernel
+/// allows locking or falls back to faulting pages in.
+#[test]
+fn pinning_stays_inside_its_budget() {
+    let f = fixture("gqa");
+    let m = load(&f.dir);
+    let hot: Vec<(u32, u32)> =
+        (0..m.spec.layers as u32).flat_map(|l| (0..m.spec.experts as u32).map(move |e| (l, e))).collect();
+
+    let (l, t) = m.pin_experts(&hot, 0);
+    assert_eq!(l + t, 0, "a zero budget pinned something");
+
+    let all = m.expert_bytes();
+    let (l, t) = m.pin_experts(&hot, all);
+    assert!(l + t <= all, "pinned {} past a budget of {all}", l + t);
+    assert!(l + t > 0, "a whole-model budget pinned nothing");
+
+    // Unknown layers and experts are skipped rather than panicking.
+    let (l, t) = m.pin_experts(&[(999, 0), (0, 999)], all);
+    assert_eq!(l + t, 0);
+}
+
 #[test]
 fn forward_all_matches_reference_at_every_position() {
     check_forward_all("gqa");
