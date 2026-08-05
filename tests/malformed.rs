@@ -49,6 +49,21 @@ fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("moe-malformed-{name}"))
 }
 
+/// A fresh path for every candidate file.
+///
+/// One path cannot be reused: a store that opens memory maps the file and the
+/// map is deliberately leaked, and Windows refuses to rewrite or delete a file
+/// with a mapped section open. On every other platform the file is removed
+/// immediately after the probe, so nothing accumulates.
+struct Paths(&'static str, usize);
+
+impl Paths {
+    fn next(&mut self) -> PathBuf {
+        self.1 += 1;
+        scratch(&format!("{}-{}", self.0, self.1))
+    }
+}
+
 /// Open `bytes` as a model. Returning is a pass; panicking fails the test.
 fn probe(path: &Path, bytes: &[u8]) {
     std::fs::write(path, bytes).unwrap();
@@ -67,26 +82,26 @@ fn probe(path: &Path, bytes: &[u8]) {
         }
         let _ = Model::load(store);
     }
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
 fn arbitrary_bytes_never_panic_a_loader() {
-    let path = scratch("random.moe");
+    let mut p = Paths("random", 0);
     let mut r = Rand(0xC0FFEE);
     // Pure noise, and noise behind each magic, so the header parsers are reached
     // rather than rejected at the first four bytes.
     for len in [0usize, 1, 4, 8, 16, 17, 64, 300] {
         for _ in 0..40 {
-            probe(&path, &r.bytes(len));
+            probe(&p.next(), &r.bytes(len));
             let mut with_magic = b"MOEF".to_vec();
             with_magic.extend(r.bytes(len));
-            probe(&path, &with_magic);
+            probe(&p.next(), &with_magic);
             let mut gguf = b"GGUF".to_vec();
             gguf.extend(r.bytes(len));
-            probe(&path, &gguf);
+            probe(&p.next(), &gguf);
         }
     }
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -98,23 +113,22 @@ fn a_corrupted_packed_model_is_refused_not_trusted() {
     // It must load before it is broken, or this proves nothing.
     assert!(Model::load(Store::open(&good).unwrap()).is_ok());
 
-    let path = scratch("broken.moe");
+    let mut p = Paths("broken", 0);
     let mut r = Rand(7);
     // Single-byte corruptions, concentrated in the header where the offsets are.
     for _ in 0..400 {
-        probe(&path, &r.mutate(&whole));
+        probe(&p.next(), &r.mutate(&whole));
     }
     // And every truncation, which is what an interrupted download leaves.
     for cut in 0..whole.len().min(600) {
-        probe(&path, &whole[..cut]);
+        probe(&p.next(), &whole[..cut]);
     }
     // Header lengths are the field that used to panic; try the extremes directly.
     for hlen in [0u64, 1, 15, u64::MAX, u64::MAX - 16, 1 << 40, 1 << 62] {
         let mut bad = whole.clone();
         bad[8..16].copy_from_slice(&hlen.to_le_bytes());
-        probe(&path, &bad);
+        probe(&p.next(), &bad);
     }
-    let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&good);
 }
 
@@ -122,14 +136,20 @@ fn a_corrupted_packed_model_is_refused_not_trusted() {
 fn a_corrupted_safetensors_shard_is_refused() {
     let f = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gqa");
     let whole = std::fs::read(f.join("model.safetensors")).unwrap();
-    let dir = scratch("shard");
-    let _ = std::fs::create_dir_all(&dir);
-    std::fs::copy(f.join("config.json"), dir.join("config.json")).unwrap();
-    let shard = dir.join("model.safetensors");
+    let mut p = Paths("shard", 0);
+    // A directory per candidate, for the same reason a file per candidate is
+    // needed above: the shard stays mapped after it is opened.
+    let mut shard = |bytes: &[u8]| -> PathBuf {
+        let dir = p.next();
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::copy(f.join("config.json"), dir.join("config.json")).unwrap();
+        std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
+        dir
+    };
 
     let mut r = Rand(11);
     for _ in 0..200 {
-        std::fs::write(&shard, r.mutate(&whole)).unwrap();
+        let dir = shard(&r.mutate(&whole));
         if let Ok(store) = Store::open(&dir) {
             let names: Vec<String> = store.names().map(String::from).collect();
             for n in &names {
@@ -137,15 +157,16 @@ fn a_corrupted_safetensors_shard_is_refused() {
             }
             let _ = Model::load(store);
         }
+        let _ = std::fs::remove_dir_all(&dir);
     }
     // A header length past the end of the file.
     for hlen in [u64::MAX, 1 << 50, whole.len() as u64] {
         let mut bad = whole.clone();
         bad[..8].copy_from_slice(&hlen.to_le_bytes());
-        std::fs::write(&shard, &bad).unwrap();
+        let dir = shard(&bad);
         let _ = Store::open(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A `tokenizer.json` arrives inside a downloaded checkpoint, so it is untrusted
@@ -233,6 +254,15 @@ fn arbitrary_templates_never_panic() {
         "{{ x.y.z.w }}",
         "{{ x[0][0][0] }}",
         "{{ ((((((1)))))) }}",
+        // A backslash in front of a multi-byte character. The lexer walks bytes
+        // and indexes the source as text, so stepping one byte past the `\` used
+        // to leave the cursor inside the character and panic on the next slice.
+        "{{ '\\é' }}",
+        "{{ '\\\u{49249}x' }}",
+        "{{ é }}",
+        "{% if é %}{% endif %}",
+        // Reduced from a fuzzer crash, which found it via the same escape.
+        "{{-\n'\n true>--\\\n{{{{ --\\{{{{{{\n\0\n \\if\\\\\\\\\\\u{49249}\n}\\\\{J*}}\r",
     ] {
         if let Ok(t) = Template::parse(src) {
             let _ = t.render(&messages, true, "", "");
@@ -242,5 +272,17 @@ fn arbitrary_templates_never_panic() {
     let deep = "{% if true %}".repeat(200) + &"{% endif %}".repeat(200);
     if let Ok(t) = Template::parse(&deep) {
         assert!(t.render(&messages, true, "", "").is_err(), "unbounded nesting was accepted");
+    }
+    // The same for an *expression*, which recurses in the parser rather than the
+    // interpreter and so has its own limit. Each of these nests a different way.
+    for deep in [
+        format!("{{{{ {}1{} }}}}", "(".repeat(5000), ")".repeat(5000)),
+        format!("{{{{ {}1 }}}}", "not ".repeat(5000)),
+        format!("{{{{ {}1 }}}}", "-".repeat(5000)),
+        format!("{{{{ {}1{} }}}}", "[".repeat(5000), "]".repeat(5000)),
+        format!("{{{{ x{} }}}}", "[0".repeat(5000)),
+        format!("{{% if {}1{} %}}{{% endif %}}", "(".repeat(5000), ")".repeat(5000)),
+    ] {
+        assert!(Template::parse(&deep).is_err(), "an expression nested 5000 deep was accepted");
     }
 }

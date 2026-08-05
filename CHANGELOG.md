@@ -38,9 +38,12 @@
 - Chat templates are rendered from the checkpoint's own Jinja `chat_template`,
   falling back to control-token detection only when the template is beyond the
   engine's subset.
-- Three faults fixed in parsers that read untrusted files: a `.moe` header length
-  that panicked when sliced, a vocabulary id trusted as an allocation size, and
-  an added token with empty content that made encoding loop forever.
+- Five faults fixed in parsers that read untrusted files: a `.moe` header length
+  that panicked when sliced, a vocabulary id trusted as an allocation size, an
+  added token with empty content that made encoding loop forever, a chat-template
+  escape that stepped one byte into a multi-byte character and panicked on the
+  next slice, and an expression parser that recursed without limit — `((((…`
+  overflowed the stack. The last two came out of `fuzz/`.
 
 ### New commands
 

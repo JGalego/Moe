@@ -262,15 +262,30 @@ fn rest<'a>(src: &'a str, word: &str) -> &'a str {
 
 // --------------------------------------------------------------- expressions
 
+/// How deep an expression may nest. Recursive descent costs stack per level, and
+/// the source is a downloaded file, so `((((((...` has to be a parse error well
+/// before it is a segfault. No real template comes close.
+const MAX_EXPR_DEPTH: usize = 64;
+
 struct Lexer<'a> {
     s: &'a [u8],
     i: usize,
     src: &'a str,
+    depth: usize,
 }
 
 impl<'a> Lexer<'a> {
     fn new(src: &'a str) -> Lexer<'a> {
-        Lexer { s: src.as_bytes(), i: 0, src }
+        Lexer { s: src.as_bytes(), i: 0, src, depth: 0 }
+    }
+
+    /// Descend one level, refusing to go deeper than the stack can take.
+    fn deeper(&mut self) -> Result<(), String> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            return Err("expression nests too deeply".into());
+        }
+        Ok(())
     }
 
     fn space(&mut self) {
@@ -286,7 +301,20 @@ impl<'a> Lexer<'a> {
         while j < self.s.len() && (self.s[j].is_ascii_alphanumeric() || self.s[j] == b'_') {
             j += 1;
         }
-        self.src[start..j].to_string()
+        self.text(start..j)
+    }
+
+    /// A byte range of the source as text. Every caller here selects ASCII, but
+    /// this goes through the lossy conversion rather than `str` indexing on
+    /// principle: the offsets are driven by untrusted input, and an index that
+    /// lands inside a multi-byte character must not be a panic.
+    fn text(&self, r: std::ops::Range<usize>) -> String {
+        String::from_utf8_lossy(&self.s[r]).into_owned()
+    }
+
+    /// Whatever is left, for an error message.
+    fn rest(&self) -> String {
+        self.text(self.i.min(self.s.len())..self.s.len())
     }
 
     fn eat_word(&mut self, w: &str) -> bool {
@@ -301,12 +329,19 @@ impl<'a> Lexer<'a> {
 
     fn eat(&mut self, lit: &str) -> bool {
         self.space();
-        if self.src[self.i..].starts_with(lit) {
+        if self.s[self.i..].starts_with(lit.as_bytes()) {
             self.i += lit.len();
             true
         } else {
             false
         }
+    }
+
+    /// The character at the cursor, or `None` if the cursor is not on a
+    /// character boundary — `str::get` returns `None` there rather than
+    /// panicking, which is the whole reason it is used.
+    fn here(&self) -> Option<char> {
+        self.src.get(self.i..).and_then(|r| r.chars().next())
     }
 
     fn done(&mut self) -> bool {
@@ -319,13 +354,26 @@ fn parse_expr(src: &str) -> Result<Expr, String> {
     let mut lx = Lexer::new(src);
     let e = p_cond(&mut lx)?;
     if !lx.done() {
-        return Err(format!("cannot parse expression: {src:?} (stopped at {:?})", &src[lx.i..]));
+        return Err(format!("cannot parse expression: {src:?} (stopped at {:?})", lx.rest()));
     }
     Ok(e)
 }
 
 /// `a if c else b`, the inline conditional Llama's template leans on.
+///
+/// Every nested sub-expression — parentheses, list items, an index, a filter's
+/// arguments — is parsed by a recursive call to this function, and the level is
+/// held for as long as that call runs. That makes this the one place the depth
+/// has to be counted (`not` and unary minus recurse without passing through it,
+/// and count themselves).
 fn p_cond(lx: &mut Lexer) -> Result<Expr, String> {
+    lx.deeper()?;
+    let e = p_cond_inner(lx);
+    lx.depth -= 1;
+    e
+}
+
+fn p_cond_inner(lx: &mut Lexer) -> Result<Expr, String> {
     let a = p_or(lx)?;
     if lx.eat_word("if") {
         let c = p_or(lx)?;
@@ -354,7 +402,12 @@ fn p_and(lx: &mut Lexer) -> Result<Expr, String> {
 
 fn p_not(lx: &mut Lexer) -> Result<Expr, String> {
     if lx.eat_word("not") {
-        return Ok(Expr::Not(Box::new(p_not(lx)?)));
+        // `not not not ...` recurses here without reaching `p_primary`, so this
+        // is the second place the depth has to be counted.
+        lx.deeper()?;
+        let e = Expr::Not(Box::new(p_not(lx)?));
+        lx.depth -= 1;
+        return Ok(e);
     }
     p_cmp(lx)
 }
@@ -475,16 +528,20 @@ fn p_primary(lx: &mut Lexer) -> Result<Expr, String> {
         while lx.i < lx.s.len() && lx.s[lx.i] != quote {
             if lx.s[lx.i] == b'\\' && lx.i + 1 < lx.s.len() {
                 lx.i += 1;
-                val.push(match lx.s[lx.i] {
-                    b'n' => '\n',
-                    b't' => '\t',
-                    b'r' => '\r',
-                    other => other as char,
+                // The escaped thing is a whole character, not a byte: stepping
+                // one byte past `\` in front of a multi-byte character would
+                // leave the cursor inside it.
+                let Some(ch) = lx.here() else { return Err("string is not valid text".into()) };
+                val.push(match ch {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    other => other,
                 });
-                lx.i += 1;
+                lx.i += ch.len_utf8();
                 continue;
             }
-            let ch = lx.src[lx.i..].chars().next().unwrap();
+            let Some(ch) = lx.here() else { return Err("string is not valid text".into()) };
             val.push(ch);
             lx.i += ch.len_utf8();
         }
@@ -517,10 +574,13 @@ fn p_primary(lx: &mut Lexer) -> Result<Expr, String> {
         }
         return Ok(Expr::List(items));
     }
-    // Unary minus, which is how a template writes `messages[-1]`.
+    // Unary minus, which is how a template writes `messages[-1]`. `-----1`
+    // recurses back here without reaching `p_cond`, so it counts itself.
     if c == b'-' {
         lx.i += 1;
+        lx.deeper()?;
         let inner = p_postfix(lx)?;
+        lx.depth -= 1;
         return Ok(match inner {
             Expr::Lit(Value::Number(n)) => match n.as_i64() {
                 Some(i) => Expr::Lit(serde_json::json!(-i)),
@@ -534,7 +594,7 @@ fn p_primary(lx: &mut Lexer) -> Result<Expr, String> {
         while lx.i < lx.s.len() && (lx.s[lx.i].is_ascii_digit() || lx.s[lx.i] == b'.') {
             lx.i += 1;
         }
-        let text = &lx.src[start..lx.i];
+        let text = lx.text(start..lx.i);
         // An integer literal stays an integer: Jinja renders `1` as "1", and a
         // template that concatenates one into a prompt must not get "1.0".
         return Ok(Expr::Lit(if text.contains('.') {
@@ -545,7 +605,7 @@ fn p_primary(lx: &mut Lexer) -> Result<Expr, String> {
     }
     let word = lx.peek_word();
     if word.is_empty() {
-        return Err(format!("unexpected {:?}", &lx.src[lx.i..]));
+        return Err(format!("unexpected {:?}", lx.rest()));
     }
     lx.i += word.len();
     Ok(match word.as_str() {

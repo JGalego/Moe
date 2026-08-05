@@ -233,21 +233,32 @@ fn a_gguf_can_be_packed() {
 fn a_truncated_gguf_is_refused() {
     let path = convert("truncated");
     let whole = std::fs::read(&path).unwrap();
-    let cut = std::env::temp_dir().join("moe-test-cut.gguf");
+    // Each candidate gets its own file. A store that opens memory maps the file
+    // and the map is deliberately never dropped, and Windows will not let a
+    // mapped file be rewritten — so reusing one path fails there for a reason
+    // that has nothing to do with what is being tested.
+    let mut n = 0;
+    let mut cut = || {
+        n += 1;
+        std::env::temp_dir().join(format!("moe-test-cut-{n}.gguf"))
+    };
     // Step through the file rather than testing every byte, which would be slow.
     for at in (0..whole.len()).step_by((whole.len() / 40).max(1)) {
-        std::fs::write(&cut, &whole[..at]).unwrap();
+        let p = cut();
+        std::fs::write(&p, &whole[..at]).unwrap();
         // Either it refuses, or it loads something coherent. It must not panic.
-        if let Ok(store) = Store::open(&cut) {
+        if let Ok(store) = Store::open(&p) {
             let _ = Model::load(store);
         }
+        let _ = std::fs::remove_file(&p);
     }
     // A header claiming a tensor beyond the data must be caught.
     let mut lying = whole.clone();
-    let n = lying.len();
-    lying.truncate(n / 2);
-    std::fs::write(&cut, &lying).unwrap();
-    let _ = Store::open(&cut);
-    let _ = std::fs::remove_file(&cut);
+    let half = lying.len() / 2;
+    lying.truncate(half);
+    let p = cut();
+    std::fs::write(&p, &lying).unwrap();
+    let _ = Store::open(&p);
+    let _ = std::fs::remove_file(&p);
     let _ = std::fs::remove_file(&path);
 }
