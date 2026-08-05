@@ -67,7 +67,9 @@ pub struct Info {
     pub name: String,
     /// Logical shape, outermost first — already reversed out of GGUF's order.
     pub shape: Vec<usize>,
-    pub dt: Dt,
+    /// The storage format, or why it cannot be read. Unreadable tensors are
+    /// only an error if something asks for them.
+    pub dt: Result<Dt, String>,
     pub offset: usize,
 }
 
@@ -239,7 +241,11 @@ impl Gguf {
             // GGUF stores the fastest-varying dimension first; the engine thinks
             // outermost-first, so this reverses.
             shape.reverse();
-            let dt = dtype(c.u32()?)?;
+            // An unreadable format is not fatal here. Files carry tensors the
+            // engine never looks at, and refusing the whole checkpoint over one
+            // of those is wrong — so the complaint is deferred to whoever
+            // actually asks for the tensor, and it names it.
+            let dt = dtype(c.u32()?);
             let offset = c.u64()? as usize;
             tensors.push(Info { name, shape, dt, offset });
         }
@@ -598,7 +604,7 @@ mod tests {
         let t = &g.tensors[0];
         // Written reversed, read back outermost-first.
         assert_eq!(t.shape, vec![3, 4]);
-        assert_eq!(t.dt, Dt::F32);
+        assert_eq!(t.dt, Ok(Dt::F32));
         assert_eq!(t.offset, 0);
         assert_eq!(g.data % 32, 0, "the data section must be aligned");
 
@@ -782,7 +788,9 @@ mod tests {
         let mut b = Builder::new();
         // 13 is Q5_K, which the engine does not read.
         b.str_kv("general.architecture", "llama").tensor("token_embd.weight", &[2, 256], 13, &[0u8; 512]);
-        let e = Gguf::parse(&b.build()).unwrap_err();
+        // The header still parses: a format nobody reads is nobody's problem.
+        let g = Gguf::parse(&b.build()).unwrap();
+        let e = g.tensors[0].dt.clone().unwrap_err();
         assert!(e.contains("Q5_K"), "{e}");
         assert!(e.contains("Q4_K"), "the error should say what is readable: {e}");
     }

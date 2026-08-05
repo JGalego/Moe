@@ -149,8 +149,15 @@ impl Store {
                 3 => (t.shape[0], t.shape[1], t.shape[2]),
                 _ => continue,
             };
+            // Only now does an unreadable format matter: this is a tensor the
+            // engine will read. Naming it beats naming only the format, because
+            // a file often has one stray tensor in a format the rest is not.
+            let dt = match &t.dt {
+                Ok(dt) => *dt,
+                Err(why) => return err(format!("{}: {why}", t.name)),
+            };
             let off = g.data + t.offset;
-            let rec = Rec { map: 0, off, dt: t.dt, slabs, rows, cols };
+            let rec = Rec { map: 0, off, dt, slabs, rows, cols };
             // Refuse a header that points past the file rather than trusting it.
             if off.checked_add(rec.len()).is_none_or(|end| end > buf.len()) {
                 return err(format!("{}: {} runs past the end of the file", file.display(), t.name));
