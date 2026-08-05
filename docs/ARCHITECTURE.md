@@ -3,17 +3,29 @@
 Each module owns one stage of getting from a model spec to a token.
 
 ```
-main.rs      CLI: run, serve, pull, pack, info, bench, tokenize
-  fetch.rs   where the model comes from -> paths, URLs, Hub repos, the cache
-  serve.rs   the OpenAI API              -> sessions, prefix reuse, chat formats
-  http.rs    the socket                  -> a bounded HTTP/1.1 server with SSE
-  store.rs   where weights live         -> mmap safetensors / .moe, tensor views
-  spec.rs    what the model is          -> shape detection from config + tensors
-  model.rs   the forward pass           -> attention, routing, experts
-  quant.rs   the arithmetic             -> block formats, dequant + matmul kernels
-  tokenizer.rs  text <-> ids
-  sample.rs  ids <- logits
+main.rs        CLI: run, chat, serve, pull, pack, info, bench, route, eval, embed
+  fetch.rs     where the model comes from -> paths, URLs, Hub repos, the cache
+  serve.rs     the OpenAI API             -> the prefix-cache pool, metrics
+  http.rs      the socket                 -> a bounded HTTP/1.1 server with SSE
+  chat.rs      a prompt from a turn       -> the Jinja subset templates need
+  store.rs     where weights live        -> mmap safetensors / .moe / GGUF, views
+  gguf.rs      the GGUF container        -> metadata, names, dimensions
+  spec.rs      what the model is         -> shape detection from config + tensors
+  model.rs     the forward pass          -> attention, routing, experts, pooling
+  quant.rs     the arithmetic            -> block formats, dequant + matmul kernels
+  generate.rs  the decode loop           -> speculation, verification, stopping
+  draft.rs     guessing ahead            -> lookup drafting, no second model
+  grammar.rs   constraining output       -> the JSON automaton and the logit mask
+  tokenizer.rs text <-> ids
+  sample.rs    ids <- logits, and verifying a draft against them
+  route.rs     what the routing did      -> statistics and the SVG
+  eval.rs      how surprised it was      -> perplexity, bits per byte
 ```
+
+Three of those are downstream of one observation. Because a routed layer touches
+only what it selected, the routing is *visible* — so `route.rs` reports it,
+`model.rs` lets it be overridden, and `store.rs` can prune a checkpoint down to
+the part a workload reaches. Nothing else in the engine has that shape.
 
 ## Resolution
 
@@ -37,12 +49,29 @@ with no TLS stack that takes local paths only.
 
 ## Storage
 
-`Store` is one lookup API over two backends. A Hugging Face directory is a set of
-`*.safetensors` shards: each has an 8-byte length, a JSON header naming every
+`Store` is one lookup API over three backends. A Hugging Face directory is a set
+of `*.safetensors` shards: each has an 8-byte length, a JSON header naming every
 tensor with its dtype, shape and byte range, then the payload. A `.moe` file is
 the same idea with a different header — `MOEF`, a version, a JSON blob holding
-the original `config.json`, an embedded `tokenizer.json` and the tensor index,
-then the payload.
+the original `config.json`, an embedded `tokenizer.json`, the chat template and
+the tensor index, then the payload. A **GGUF** file is the same idea again, with
+typed binary metadata instead of JSON.
+
+GGUF needs three translations and no conversion. Tensor names are rewritten onto
+the Hugging Face ones detection reads (`blk.3.ffn_gate_exps.weight` becomes
+`model.layers.3.mlp.experts.gate_proj`); dimensions are reversed, because GGUF
+stores the fastest-varying first; and the config, vocabulary and chat template are
+synthesised from metadata keys. The *weights* are untouched, because GGUF's
+`Q4_0`, `Q5_0` and `Q8_0` blocks are byte-for-byte the engine's Q4, Q5 and Q8.
+`Q4_K` and `Q6_K` are 256-value super-block formats with per-sub-block scales, and
+get their own readers; they are read-only, since writing them well needs the
+search llama.cpp does at quantisation time.
+
+Every length and offset in all three headers is checked before use, and each
+tensor is validated to lie inside the map when the index is built. These are the
+only parsers that read bytes the user did not write, and on a memory-mapped file a
+bounds mistake is worse than a crash. `tests/malformed.rs` sweeps them with
+mutations and truncations on every commit; `fuzz/` goes deeper.
 
 Both are memory mapped, and the maps are deliberately leaked. They live as long
 as the process anyway, and leaking them means every weight view can be
@@ -60,6 +89,12 @@ payload is `slabs * rows` contiguous rows of `cols` values. `Store::view` takes 
 slab index and a row range, so one expert inside a fused stack is an offset
 calculation, and no unpacking step exists to be skipped.
 
+Three expert layouts exist in the wild and which one a checkpoint uses is visible
+in its tensors rather than its config: one fused `[E, 2*inter, hidden]` stack
+holding gate and up together, a separate 3-D stack per projection (what GGUF
+writes), or a tensor per expert. All three address an expert as a row range, so
+the forward pass does not care which it got.
+
 ### Packing
 
 `moe pack` walks the index, picks a target format per tensor, and rewrites the
@@ -69,9 +104,18 @@ biases, router gates and anything 1-D stay f32. Everything else goes to
 width is not a multiple of the 32-value block falls back to f32 rather than
 silently changing shape.
 
-Packing is optional. Running from a raw Hugging Face directory works and gives
-identical results; packing exists to make the file smaller and its layout more
-convenient, and to fold the tokenizer in.
+Two refinements ride on the same walk. `--hot-experts` reads a trace and gives the
+experts a workload leans on a finer format than the rest, which is a better trade
+than one rate for all of them because routing is skewed. And `--keep-experts`
+prunes: kept experts are renumbered contiguously, the router is narrowed to
+exactly the rows that survive — in the same order — the per-expert gate bias is
+narrowed by *column* instead, fused stacks keep whole slabs, and the config is
+rewritten so a loader detects the count it actually has. What comes out is a
+smaller model, not a checkpoint with holes in it.
+
+Packing is optional. Running from a raw Hugging Face directory or a GGUF works and
+gives identical results; packing exists to make the file smaller and its layout
+more convenient, and to fold the tokenizer and chat template in.
 
 ## Quantisation and kernels
 
@@ -80,11 +124,23 @@ Weights are stored as `F32`, `F16`, `BF16`, or block-quantised:
 | Format | Layout per 32 values | Bits/weight |
 | --- | --- | --- |
 | `Q8` | f16 scale + 32 int8 | 8.5 |
+| `Q6` | f16 scale + 16 byte pairs + a 2-bit plane | 6.5 |
+| `Q5` | f16 scale + a 1-bit plane + 16 byte pairs | 5.5 |
 | `Q4` | f16 scale + 16 packed byte pairs | 4.5 |
 
-Both are symmetric: `Q8` stores `round(v / d)` with `d = max|v| / 127`, `Q4`
-stores `round(v / d) + 8` in a nibble with `d = max|v| / 7`, low nibbles holding
-the first half of the block and high nibbles the second.
+All four are symmetric, and all four share one layout so the same indexing
+reasoning holds for each: value `i` in the low nibble of byte `i`, value `i + 16`
+in the high nibble. `Q8` stores `round(v / d)` with `d = max|v| / 127`; `Q4`
+stores `round(v / d) + 8` in a nibble with `d = max|v| / 7`; `Q5` and `Q6` add the
+remaining bits in a trailing plane — one bit each packed eight to a byte, or two
+bits packed four to a byte. `Q5`'s plane sits *before* its nibbles, which is
+GGUF's `Q5_0` layout, so such a tensor is read with no conversion.
+
+GGUF's two K-quant formats are read as well. They are 256-value super-blocks with
+a scale per 32-value sub-block rather than one for the whole block, which is what
+buys their accuracy, and they are read-only: writing them well needs the search
+llama.cpp does at quantisation time, so `Dt::parse` does not accept their names
+and the CLI cannot ask for one.
 
 The kernel is deliberately uniform. Instead of a specialised inner loop per
 format, `matmul` dequantises one weight row into a small f32 scratch buffer and
@@ -220,20 +276,58 @@ whole chunk — is so much faster per token than decode.
 activations happened, how many repeated the previous token's choice, and how many
 expert bytes were touched.
 
+## Decoding
+
+`generate.rs` holds the decode loop, and one invariant explains its shape:
+`pending` is a token that has been committed and handed to the caller but is not
+yet in the KV cache. Every round forwards it — together with any draft riding
+behind it — and ends with the next committed token in its place.
+
+With no draft, that round is an ordinary single-token decode. So speculation is
+not a second code path: `--draft N` asks `draft.rs` for a guess at the next N
+tokens, the round forwards `[pending, ...draft]` in one step, and each row of the
+result judges the draft token after it. Whatever prefix the model agrees with is
+kept and the rest of the cache is rewound — which is the same `State::truncate`
+the server's prefix reuse uses, so both rest on the same tested property.
+
+Verification lives in `sample.rs`, next to the sampler whose distribution it has
+to match. Greedily, a guess is accepted exactly when it is the argmax. With
+temperature, it is accepted with probability `p(guess)` and a rejection draws from
+the target with the guess removed and renormalised — the standard correction for a
+drafter that proposes one token with certainty, which every lookup drafter is.
+That is why speculation is lossless rather than merely close, and why the
+correction is checked empirically rather than argued for.
+
+A constraint hooks the same rows. `grammar.rs` compiles a JSON Schema into a
+pushdown automaton over *bytes* — bytes, because a token is an arbitrary byte
+string that straddles any boundary — and masks every candidate whose bytes could
+not continue a valid document. Its state is `Copy` and shallow, so testing a
+candidate is a stack copy of a few dozen bytes; over a 50k vocabulary that is a
+small fraction of the forward pass it rides along with. Constraints and
+speculation compose with no special case: a drafted token that would break the
+grammar has probability zero and is rejected like any other bad guess.
+
 ## Serving
 
-`moe serve` puts one `State` behind a mutex and lets connections queue on it.
-That is not a placeholder for batching: at batch size one the engine is
+`moe serve` puts a pool of `State` behind one mutex and lets connections queue on
+it. Serialising is not a placeholder for batching: at batch size one the engine is
 memory-bandwidth-bound and rayon already has every core, so a second concurrent
 generation would take throughput from the first rather than add any. Real
 concurrency needs continuous batching — shared prefill, per-sequence KV pools, a
 scheduler — which is a different engine.
 
-Keeping one session is what buys the prefix cache. The session remembers the
-token ids that produced its cache; a new request finds the longest common prefix
-with them, calls `State::truncate` to move the cursor back to it, and prefills
-only the remainder. Conversations grow by appending, so each turn prefills the
-message that was added rather than the whole transcript.
+Queueing is what buys the prefix cache. Each slot remembers the token ids that
+produced its cache; a new request takes the slot sharing the longest prefix with
+it, calls `State::truncate` to move that cursor back, and prefills only the
+remainder. Conversations grow by appending, so each turn prefills the message that
+was added rather than the whole transcript.
+
+The pool exists because one slot is not enough: with a single cache, two clients
+taking turns evict each other on every request and the feature that made a second
+turn cheap does nothing at all. `--slots N` holds several; a request that matches
+nothing takes the coldest rather than evicting a conversation that may come back.
+The cost is exact and worth stating rather than burying — one full KV cache per
+slot — so the default is 1 and the memory is opted into.
 
 Truncation is cheap because the KV cache is append-only per position: nothing
 needs clearing, since whatever is forwarded next overwrites it. What does get
@@ -248,11 +342,38 @@ assertion is on logits deliberately: the difference a stale cache makes is aroun
 1e-3, which changes no argmax on the fixtures and would sail past any test that
 compared generated tokens.
 
-Chat formats are recognised the way everything else is — by what the checkpoint
-contains. A vocabulary with `<|im_start|>` is chatml, `<|start_header_id|>` is
-llama3, `[/INST]` is mistral. Rather than interpret a Jinja template, each format
-is a per-role prefix and suffix plus the opening of the assistant's turn. A
-checkpoint matching none of them gets an error, not a guess.
+Chat formats come from the checkpoint too, but by *declaration* rather than
+inference: instruct models ship their format as a Jinja `chat_template` in
+`tokenizer_config.json`, and `chat.rs` renders it. That is a subset of Jinja — the
+tags, operators, tests and filters chat templates actually use — and anything
+outside it is a parse error rather than a silent misrendering.
+
+When a template cannot be rendered, the older path takes over: a vocabulary with
+`<|im_start|>` is chatml, `<|start_header_id|>` is llama3, `[/INST]` is mistral,
+each expressed as a per-role prefix and suffix plus the opening of the assistant's
+turn. Falling back to a working guess beats failing, and both beat rendering a
+prompt wrongly. A checkpoint matching neither gets an error, not a guess.
+
+## Reading the routing
+
+Everything in `route.rs` is a statistic over the flat `(position, layer, experts)`
+list a trace is. Three of them are worth the name. Normalised **entropy** says
+whether a router is using its capacity — 1.0 is an even spread, 0.0 is every token
+choosing the same expert. **Peak over uniform** says how lopsided the busiest
+expert is. **Coverage** says what fraction of `(layer, expert)` pairs a prompt
+touched at all, which is the number that says whether pruning would pay.
+
+The SVG is the same numbers. Colour follows the job: one hue with monotone
+lightness for magnitude, two hues either side of a neutral grey for polarity, both
+interpolated in OKLab so the steps are perceptually even. Those two properties are
+asserted in a test rather than eyeballed — a sequential ramp must rise
+monotonically in lightness, and a diverging midpoint must be the least chromatic
+step, or zero reads as a value.
+
+`Routing` in `model.rs` is the other direction: refuse an expert and the weights
+renormalise over what remains, force one and it displaces the weakest pick, raise
+the router temperature and the choice flattens. It is empty by default and checked
+only when not, so an ordinary run pays nothing for it existing.
 
 ## Tracing the routing
 
