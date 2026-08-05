@@ -743,9 +743,11 @@ fn serve(args: &Args, path: &Path, spec: &str) {
 }
 
 fn tokenize(args: &Args, path: &Path) {
-    // A packed model carries its own tokenizer; a bare tokenizer.json works too.
+    // A packed model and a GGUF both carry their own tokenizer; a bare
+    // tokenizer.json works too. Identify by content rather than extension, the
+    // same way `Store::open` does — GGUF files are named every imaginable way.
     let store =
-        if path.is_file() && path.extension().is_some_and(|e| e == "moe") { Store::open(path).ok() } else { None };
+        if path.is_file() && path.extension().is_none_or(|e| e != "json") { Store::open(path).ok() } else { None };
     let tok = tokenizer_for(args, path, store.as_ref()).unwrap_or_else(|| fail("no tokenizer found"));
     if let Some(list) = args.get("decode") {
         let ids: Vec<u32> = list.split(',').filter_map(|s| s.trim().parse().ok()).collect();
@@ -826,6 +828,10 @@ fn eval(args: &Args, path: &Path) {
     if ids.len() < 2 {
         fail("need at least two tokens to score one prediction");
     }
+    // bits-per-byte has to describe the bytes actually scored, so a --limit that
+    // truncates the token stream has to shrink the denominator with it. Reading
+    // the whole file's length here would divide by bytes nobody looked at.
+    let bytes = if bytes > 0 { tok.as_ref().map(|t| t.decode(&ids).len()).unwrap_or(bytes) } else { 0 };
 
     let ctx = args.get("ctx").and_then(|v| v.parse().ok()).unwrap_or_else(|| m.spec.max_ctx.min(2048)).max(2);
     let stride: usize = args.num("stride", (ctx / 2).max(1));
@@ -1089,8 +1095,20 @@ fn embed(args: &Args, path: &Path) {
 }
 
 /// A short display name for a resolved model path.
+///
+/// A cached Hub model lives at `.../owner--name/<revision>`, so the last
+/// component is a revision like `main` — which names nothing. Fall back to the
+/// directory above it, which is the repo.
 fn name_of(p: &Path) -> String {
-    p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.display().to_string())
+    let last = p.file_name().map(|n| n.to_string_lossy().to_string());
+    let looks_like_a_revision = |s: &str| s == "main" || s == "master" || s.starts_with("refs");
+    match last {
+        Some(name) if looks_like_a_revision(&name) => {
+            p.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().replace("--", "/")).unwrap_or(name)
+        }
+        Some(name) => name,
+        None => p.display().to_string(),
+    }
 }
 
 /// The basename of a path, for labelling a diff without its directory.

@@ -15,7 +15,7 @@ Enter
 Type "  -p 'a cat sat on the mat' --vs 'the kitten rested on the rug'"
 Sleep 700ms
 Enter
-Sleep 10s
+Sleep 8s
 
 Type "moe embed allenai/OLMoE-1B-7B-0924-Instruct --pool last \"
 Enter

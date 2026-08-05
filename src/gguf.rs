@@ -304,6 +304,27 @@ impl Gguf {
         set(&mut c, "max_position_embeddings", int(self, "context_length").map(|v| json!(v)));
         set(&mut c, "num_experts", int(self, "expert_count").map(|v| json!(v)));
         set(&mut c, "num_experts_per_tok", int(self, "expert_used_count").map(|v| json!(v)));
+        set(&mut c, "routed_scaling_factor", float(self, "expert_weights_scale").map(|v| json!(v)));
+        set(&mut c, "n_group", int(self, "expert_group_count").map(|v| json!(v)));
+        set(&mut c, "topk_group", int(self, "expert_group_used_count").map(|v| json!(v)));
+        // 1 is softmax, 2 is sigmoid, in llama.cpp's numbering.
+        if let Some(g) = int(self, "expert_gating_func") {
+            set(&mut c, "scoring_func", Some(json!(if g == 2 { "sigmoid" } else { "softmax" })));
+        }
+        // Whether the top-k routing weights are renormalised after selection.
+        //
+        // Some checkpoints state it; most do not, because llama.cpp folds it into
+        // the architecture rather than the metadata. Getting it wrong produces
+        // fluent nonsense rather than an error — the experts are right and their
+        // mixture is not — so an architecture default is not optional here.
+        let norm = self
+            .arch_key("expert_weights_norm")
+            .and_then(|v| match v {
+                Meta::Bool(b) => Some(*b),
+                other => other.as_i64().map(|i| i != 0),
+            })
+            .unwrap_or_else(|| !matches!(self.arch(), "olmoe"));
+        set(&mut c, "norm_topk_prob", Some(json!(norm)));
         set(&mut c, "rms_norm_eps", float(self, "attention.layer_norm_rms_epsilon").map(|v| json!(v)));
         set(&mut c, "rope_theta", float(self, "rope.freq_base").map(|v| json!(v)));
         set(&mut c, "sliding_window", int(self, "attention.sliding_window").map(|v| json!(v)));
@@ -325,7 +346,17 @@ impl Gguf {
             c.remove("num_experts_per_tok");
         }
         let ids = |m: &Gguf, k: &str| m.get(&format!("tokenizer.ggml.{k}")).and_then(|v| v.as_i64());
-        set(&mut c, "bos_token_id", ids(self, "bos_token_id").map(|v| json!(v)));
+        // GGUF names a beginning-of-sequence token *and* says whether to prepend
+        // it. Honouring the id but not the flag silently prefixes every prompt
+        // with a token the checkpoint did not want — which does not fail, it just
+        // scores and generates as a different model would.
+        let add_bos = self.get("tokenizer.ggml.add_bos_token").and_then(|v| match v {
+            Meta::Bool(b) => Some(*b),
+            other => other.as_i64().map(|i| i != 0),
+        });
+        if add_bos != Some(false) {
+            set(&mut c, "bos_token_id", ids(self, "bos_token_id").map(|v| json!(v)));
+        }
         set(&mut c, "eos_token_id", ids(self, "eos_token_id").map(|v| json!(v)));
         Value::Object(c)
     }
@@ -598,6 +629,49 @@ mod tests {
         assert_eq!(cfg["rope_scaling"]["original_max_position_embeddings"], 4096);
         // And the spec must read it back.
         assert_eq!(cfg["architectures"][0], "qwen2moeForCausalLM");
+    }
+
+    /// Routing details that GGUF states differently, or does not state at all.
+    ///
+    /// Getting these wrong does not fail: the experts are right and their mixture
+    /// is not, so the model emits fluent nonsense. That makes them exactly the
+    /// keys worth pinning down.
+    #[test]
+    fn routing_details_survive_the_translation() {
+        // Stated explicitly, in the form deepseek-style checkpoints use.
+        let mut b = Builder::new();
+        b.str_kv("general.architecture", "deepseek2")
+            .u32_kv("deepseek2.expert_count", 64)
+            .u32_kv("deepseek2.expert_used_count", 6)
+            .u32_kv("deepseek2.expert_gating_func", 2)
+            .f32_kv("deepseek2.expert_weights_scale", 2.5)
+            .u32_kv("deepseek2.expert_group_count", 8)
+            .u32_kv("deepseek2.expert_group_used_count", 3);
+        let cfg = Gguf::parse(&b.build()).unwrap().config();
+        assert_eq!(cfg["scoring_func"], "sigmoid");
+        assert_eq!(cfg["routed_scaling_factor"], 2.5);
+        assert_eq!(cfg["n_group"], 8);
+        assert_eq!(cfg["topk_group"], 3);
+        // Absent, so it takes the general default.
+        assert_eq!(cfg["norm_topk_prob"], true);
+
+        // OLMoE does not renormalise, and no OLMoE GGUF says so — llama.cpp
+        // folds it into the architecture. The default has to know that.
+        let mut o = Builder::new();
+        o.str_kv("general.architecture", "olmoe").u32_kv("olmoe.expert_count", 64);
+        assert_eq!(Gguf::parse(&o.build()).unwrap().config()["norm_topk_prob"], false);
+
+        // An explicit key always wins over the architecture default.
+        let mut e = Builder::new();
+        e.str_kv("general.architecture", "olmoe")
+            .u32_kv("olmoe.expert_count", 64)
+            .u32_kv("olmoe.expert_weights_norm", 1);
+        assert_eq!(Gguf::parse(&e.build()).unwrap().config()["norm_topk_prob"], true);
+
+        // A gating function of 1 is softmax, the common case.
+        let mut g = Builder::new();
+        g.str_kv("general.architecture", "qwen2moe").u32_kv("qwen2moe.expert_gating_func", 1);
+        assert_eq!(Gguf::parse(&g.build()).unwrap().config()["scoring_func"], "softmax");
     }
 
     #[test]

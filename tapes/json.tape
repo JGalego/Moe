@@ -26,4 +26,4 @@ Enter
 Type "  -p 'Ada Lovelace, 36, an administrator. As JSON: '"
 Sleep 700ms
 Enter
-Sleep 14s
+Sleep 12s

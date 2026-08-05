@@ -19,4 +19,4 @@ Enter
 Type "  -o assets/routing.svg"
 Sleep 700ms
 Enter
-Sleep 12s
+Sleep 14s

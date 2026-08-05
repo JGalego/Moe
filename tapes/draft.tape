@@ -15,7 +15,7 @@ Show
 Type "moe run allenai/OLMoE-1B-7B-0924-Instruct -p \"$P\" -n 32 --no-stream"
 Sleep 700ms
 Enter
-Sleep 18s
+Sleep 12s
 
 Type "moe run allenai/OLMoE-1B-7B-0924-Instruct -p \"$P\" -n 32 --no-stream --draft 8"
 Sleep 700ms

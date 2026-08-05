@@ -12,7 +12,7 @@ Show
 Type "moe info Qwen/Qwen1.5-MoE-A2.7B-Chat-GGUF"
 Sleep 700ms
 Enter
-Sleep 25s
+Sleep 18s
 
 Type "moe run Qwen/Qwen1.5-MoE-A2.7B-Chat-GGUF -n 24 \"
 Enter
