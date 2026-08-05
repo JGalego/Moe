@@ -15,6 +15,7 @@ USAGE
   moe bench <model> [options]        measure prefill and decode throughput
   moe tokenize <model> -p TEXT       show token ids (--decode 1,2,3 reverses it)
   moe serve <model> [options]        OpenAI-compatible HTTP server
+  moe route <model|trace> [options]  analyse which experts the routing selected
 
 <model> is any of:
   ./model.moe                        a packed model file
@@ -50,6 +51,15 @@ SERVE OPTIONS
       --max-queue N         requests allowed to wait before 503     [32]
       --no-prefix-cache     re-prefill every request instead of reusing the cache
       --cors                allow browser origins
+
+ROUTE OPTIONS
+  Takes a model plus a prompt, or one or two *.jsonl traces from --trace.
+  -p, --prompt TEXT         prompt to route (--ids 1,2,3 for raw ids)
+      --vs TEXT             second prompt: report the difference
+      --vs-ids 1,2,3        second prompt as raw ids
+  -n, --tokens N            also route this many generated tokens    [0]
+      --top N               busiest experts to list per layer        [5]
+  -o, --out PATH            write the heatmap as SVG
 
 PACK OPTIONS
   -o, --out PATH            output file                   [./<name>.moe]
@@ -155,6 +165,10 @@ fn main() {
         println!("{}", path.display());
         return;
     }
+    // `route` also accepts trace files, which are not models to resolve.
+    if args.cmd == "route" && spec.ends_with(".jsonl") {
+        return route_traces(&args);
+    }
     let path = fetched(&args, &spec);
 
     match args.cmd.as_str() {
@@ -164,6 +178,7 @@ fn main() {
         "pack" => pack(&args, &path, &spec),
         "tokenize" => tokenize(&args, &path),
         "serve" => serve(&args, &path, &spec),
+        "route" => route_model(&args, &path),
         other => fail(format!("unknown command '{other}' (try --help)")),
     }
 }
@@ -457,6 +472,112 @@ fn write_trace(path: &str, m: &Model, st: &State, tok: Option<&Tokenizer>) -> st
         writeln!(f, "{line}")?;
     }
     Ok(tr.routes.len())
+}
+
+/// The basename of a path, for labelling a diff without its directory.
+fn base(p: &str) -> &str {
+    p.rsplit(['/', '\\']).next().unwrap_or(p)
+}
+
+fn write_svg(args: &Args, doc: &str) {
+    if let Some(out) = args.get("out") {
+        match std::fs::write(out, doc) {
+            Ok(()) => eprintln!("-> {out}"),
+            Err(e) => fail(format!("{out}: {e}")),
+        }
+    }
+}
+
+/// `moe route a.jsonl [b.jsonl]` — analyse traces already on disk.
+fn route_traces(args: &Args) {
+    let top: usize = args.num("top", 5);
+    let read = |p: &str| {
+        let c = moe::Counts::read(Path::new(p)).unwrap_or_else(|e| fail(format!("{p}: {e}")));
+        if c.is_empty() {
+            fail(format!("{p}: no routing records (a dense model traces nothing)"));
+        }
+        c
+    };
+    let a = read(&args.pos[0]);
+    match args.pos.get(1) {
+        Some(second) => {
+            let d = moe::route::Diff { a, b: read(second) };
+            print!("{}", d.report(top));
+            write_svg(args, &moe::route::diffmap(&d, (base(&args.pos[0]), base(second)), args.get("title")));
+        }
+        None => {
+            print!("{}", a.report(top));
+            write_svg(args, &moe::route::heatmap(&a, args.get("title")));
+        }
+    }
+}
+
+/// One side of a routing comparison: prompt text, or raw ids for a checkpoint
+/// with no tokenizer beside it.
+enum Side<'a> {
+    Text(&'a str),
+    Ids(&'a str),
+}
+
+/// `moe route <model> -p TEXT [--vs TEXT]` — route a prompt and analyse it in
+/// one step, so seeing where two prompts diverge needs no intermediate files.
+fn route_model(args: &Args, path: &Path) {
+    let m = load(path);
+    if m.spec.experts == 0 {
+        fail("this checkpoint is dense: it has no routing to analyse");
+    }
+    let tok = tokenizer_for(args, path, Some(&m.store));
+    let n_gen: usize = args.num("tokens", 0);
+    let top: usize = args.num("top", 5);
+
+    // Each prompt gets its own state, so the two runs cannot see each other.
+    let count = |side: Side| -> moe::Counts {
+        let ids = match side {
+            Side::Ids(list) => list.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
+            Side::Text(text) => match tok.as_ref() {
+                Some(t) => t.encode(text, m.spec.bos),
+                None => fail("no tokenizer found; pass --tokenizer, or give --ids"),
+            },
+        };
+        if ids.is_empty() {
+            fail("empty prompt");
+        }
+        let ctx = (ids.len() + n_gen + 1).max(8);
+        let mut st = State::new(&m, ctx);
+        st.trace();
+        let mut logits = prefill(&m, &ids, &mut st);
+        let sampler = Sampler::default();
+        let mut rng = Rng::new(0);
+        let mut history = ids.clone();
+        for _ in 0..n_gen {
+            let next = sampler.pick(&mut logits, &history, &mut rng);
+            if m.spec.eos.contains(&next) || st.pos + 1 >= ctx {
+                break;
+            }
+            history.push(next);
+            logits = m.forward(&[next], &mut st);
+        }
+        moe::Counts::from_trace(st.trace.as_ref().unwrap(), &m.spec.arch, m.spec.experts, m.spec.top_k)
+    };
+
+    let first = match (args.get("prompt"), args.get("ids")) {
+        (Some(t), _) => Side::Text(t),
+        (None, Some(l)) => Side::Ids(l),
+        _ => fail("give --prompt or --ids (or pass a *.jsonl trace)"),
+    };
+    let a = count(first);
+    let second = args.get("vs").map(Side::Text).or_else(|| args.get("vs-ids").map(Side::Ids));
+    match second {
+        Some(other) => {
+            let d = moe::route::Diff { a, b: count(other) };
+            print!("{}", d.report(top));
+            write_svg(args, &moe::route::diffmap(&d, ("first", "second"), args.get("title")));
+        }
+        None => {
+            print!("{}", a.report(top));
+            write_svg(args, &moe::route::heatmap(&a, args.get("title")));
+        }
+    }
 }
 
 fn bench(args: &Args, path: &Path) {

@@ -22,6 +22,7 @@ pub mod fetch;
 pub mod http;
 pub mod model;
 pub mod quant;
+pub mod route;
 pub mod sample;
 pub mod serve;
 pub mod spec;
@@ -29,8 +30,9 @@ pub mod store;
 pub mod tokenizer;
 
 pub use fetch::{cache_dir, resolve, Source};
-pub use model::{Model, State, Stats};
+pub use model::{Model, Route, State, Stats, Trace};
 pub use quant::{Dt, QT};
+pub use route::Counts;
 pub use sample::{Rng, Sampler};
 pub use serve::{ChatFormat, Server};
 pub use spec::Spec;
