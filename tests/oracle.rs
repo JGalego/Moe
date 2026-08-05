@@ -259,6 +259,93 @@ fn mean_pooling_equals_the_mean_of_the_positions() {
     assert!(d < 1e-4, "mean pooling over 70 tokens is off by {d} from the mean of its positions");
 }
 
+/// Every routing intervention must be observable in the trace, and no
+/// intervention must be indistinguishable from none.
+#[test]
+fn router_interventions_do_what_they_say() {
+    let f = fixture("gqa");
+    let baseline = load(&f.dir);
+    let (layers, experts, top_k) = (baseline.spec.layers, baseline.spec.experts, baseline.spec.top_k);
+
+    // Which experts a run selected, per layer.
+    let selected = |m: &Model| -> Vec<Vec<u32>> {
+        let mut st = State::new(m, 32);
+        st.trace();
+        m.forward(&f.tokens, &mut st);
+        let tr = st.trace.as_ref().unwrap();
+        (0..layers as u32)
+            .map(|l| {
+                let mut v: Vec<u32> =
+                    tr.routes.iter().filter(|r| r.layer == l).flat_map(|r| r.experts.iter().map(|(e, _)| *e)).collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            })
+            .collect()
+    };
+
+    let before = selected(&baseline);
+    assert!(before.iter().any(|l| !l.is_empty()), "nothing was routed at all");
+
+    // An empty Routing must change nothing.
+    let mut untouched = load(&f.dir);
+    untouched.routing = moe::Routing::default();
+    assert!(untouched.routing.is_empty());
+    assert_eq!(selected(&untouched), before, "an empty intervention changed the routing");
+
+    // Disabling an expert everywhere must remove it from every layer.
+    let victim = before.iter().flatten().copied().next().expect("some expert was selected");
+    let mut ablated = load(&f.dir);
+    ablated.routing = moe::Routing {
+        disabled: (0..layers as u32).map(|l| (l, victim)).collect(),
+        ..Default::default()
+    };
+    let after = selected(&ablated);
+    assert!(after.iter().all(|l| !l.contains(&victim)), "expert {victim} survived being disabled: {after:?}");
+    // ...and the selection must still be full, filled from what the router liked next.
+    for (l, picks) in after.iter().enumerate() {
+        if !before[l].is_empty() {
+            assert!(!picks.is_empty(), "layer {l} routed nothing after an ablation");
+        }
+    }
+
+    // Forcing an expert must put it in every layer's selection.
+    let target = ((victim + 1) % experts as u32).min(experts as u32 - 1);
+    let mut forced = load(&f.dir);
+    forced.routing =
+        moe::Routing { forced: (0..layers as u32).map(|l| (l, target)).collect(), ..Default::default() };
+    for (l, picks) in selected(&forced).iter().enumerate() {
+        if !before[l].is_empty() {
+            assert!(picks.contains(&target), "layer {l} did not select forced expert {target}: {picks:?}");
+        }
+    }
+
+    // Raising top-k must select more experts; lowering it, fewer.
+    let count = |k: usize| -> usize {
+        let mut m = load(&f.dir);
+        m.routing = moe::Routing { top_k: k, ..Default::default() };
+        let mut st = State::new(&m, 32);
+        st.trace();
+        m.forward(&f.tokens, &mut st);
+        st.trace.as_ref().unwrap().routes.iter().map(|r| r.experts.len()).max().unwrap_or(0)
+    };
+    assert_eq!(count(1), 1, "top-k 1 selected more than one expert");
+    assert_eq!(count(experts), experts, "top-k of everything did not select everything");
+    assert_eq!(count(0), top_k, "top-k 0 should keep the checkpoint's own");
+
+    // A flattened router must still produce valid, normalised weights.
+    let mut warm = load(&f.dir);
+    warm.routing = moe::Routing { temp: 50.0, ..Default::default() };
+    let mut st = State::new(&warm, 32);
+    st.trace();
+    warm.forward(&f.tokens, &mut st);
+    for r in &st.trace.as_ref().unwrap().routes {
+        let total: f32 = r.experts.iter().map(|(_, w)| w).sum();
+        assert!((total - 1.0).abs() < 1e-3, "flattening broke normalisation: weights sum to {total}");
+        assert!(r.experts.iter().all(|(_, w)| *w >= 0.0), "a negative routing weight");
+    }
+}
+
 #[test]
 fn forward_all_matches_reference_at_every_position() {
     check_forward_all("gqa");

@@ -196,6 +196,9 @@ pub struct Model {
     /// probably want. Free when the weights are already resident, and the
     /// difference between streaming and stalling when they are not.
     pub prefetch: bool,
+    /// Interventions on the router. Empty by default, and checked only when not,
+    /// so an ordinary run pays nothing for this existing.
+    pub routing: Routing,
     /// Inverse rotary frequencies, one per rotated pair, with any context
     /// extension already folded in.
     inv_freq: Vec<f32>,
@@ -221,6 +224,58 @@ fn softmax(x: &mut [f32]) {
     }
     for v in x.iter_mut() {
         *v /= s;
+    }
+}
+
+/// Overrides on the router, for asking what an expert is actually for.
+///
+/// Routing is the one part of a sparse model that can be intervened on without
+/// touching a weight: refuse an expert and see what the answer becomes, force one
+/// and see what it insists on, flatten the gate and see how much the choice
+/// mattered. None of this is needed to run a model — it is needed to understand
+/// one, which is the thing a sparse checkpoint makes possible and nothing else
+/// exposes.
+#[derive(Clone, Default, Debug)]
+pub struct Routing {
+    /// `(layer, expert)` the router may not select. Weights renormalise over what
+    /// remains, so this asks "what if this expert were unavailable" rather than
+    /// "what if its output were zero".
+    pub disabled: Vec<(u32, u32)>,
+    /// `(layer, expert)` always selected, displacing the weakest pick.
+    pub forced: Vec<(u32, u32)>,
+    /// Divides the router logits before gating. Above 1 flattens the choice
+    /// towards uniform, below 1 sharpens it towards a single expert. 0 means
+    /// leave it alone.
+    pub temp: f32,
+    /// Experts per token, overriding the checkpoint. 0 keeps its own.
+    pub top_k: usize,
+}
+
+impl Routing {
+    pub fn is_empty(&self) -> bool {
+        self.disabled.is_empty() && self.forced.is_empty() && self.temp <= 0.0 && self.top_k == 0
+    }
+
+    fn at(list: &[(u32, u32)], layer: usize) -> impl Iterator<Item = usize> + '_ {
+        let layer = layer as u32;
+        list.iter().filter(move |(l, _)| *l == layer).map(|(_, e)| *e as usize)
+    }
+
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.disabled.is_empty() {
+            parts.push(format!("{} experts disabled", self.disabled.len()));
+        }
+        if !self.forced.is_empty() {
+            parts.push(format!("{} forced", self.forced.len()));
+        }
+        if self.temp > 0.0 {
+            parts.push(format!("router temp {:.2}", self.temp));
+        }
+        if self.top_k > 0 {
+            parts.push(format!("top-{}", self.top_k));
+        }
+        parts.join(", ")
     }
 }
 
@@ -387,7 +442,17 @@ impl Model {
             });
         }
         let inv_freq = spec.rope.inv_freqs(spec.head_dim);
-        Ok(Model { spec, store, prefetch: true, inv_freq, embed, out_norm, lm_head, layers })
+        Ok(Model {
+            spec,
+            store,
+            prefetch: true,
+            routing: Routing::default(),
+            inv_freq,
+            embed,
+            out_norm,
+            lm_head,
+            layers,
+        })
     }
 
     /// The weight blocks one expert occupies, in the order the forward pass
@@ -754,6 +819,12 @@ impl Model {
                 let n = experts.len();
                 let mut logits = vec![0.0f32; t * n];
                 matmul(router, x, &mut logits);
+                // Router temperature acts on the logits, before the gate, which
+                // is the only place it means "how decisive is this choice".
+                if self.routing.temp > 0.0 {
+                    logits.iter_mut().for_each(|v| *v /= self.routing.temp);
+                }
+                let top_k = if self.routing.top_k > 0 { self.routing.top_k } else { s.top_k };
 
                 // Route: score, optional group pruning, top-k, renormalise.
                 let mut picks: Vec<Vec<(usize, f32)>> = Vec::with_capacity(t);
@@ -771,10 +842,29 @@ impl Model {
                     if s.n_group > 1 && s.topk_group < s.n_group {
                         prune_groups(&mut rank, s.n_group, s.topk_group);
                     }
+                    // A disabled expert is unrankable, so the selection fills up
+                    // with whatever the router liked next.
+                    for e in Routing::at(&self.routing.disabled, li) {
+                        if e < n {
+                            rank[e] = f32::NEG_INFINITY;
+                        }
+                    }
                     let mut idx: Vec<usize> = (0..n).collect();
                     idx.sort_unstable_by(|a, b| rank[*b].total_cmp(&rank[*a]));
-                    idx.truncate(s.top_k.min(n));
-                    let mut w: Vec<f32> = idx.iter().map(|e| sc[*e]).collect();
+                    idx.truncate(top_k.min(n));
+                    // Forced experts take the weakest slots, so top-k is unchanged.
+                    for e in Routing::at(&self.routing.forced, li) {
+                        if e < n && !idx.contains(&e) {
+                            match idx.last_mut() {
+                                Some(slot) => *slot = e,
+                                None => idx.push(e),
+                            }
+                            idx.sort_unstable_by(|a, b| rank[*b].total_cmp(&rank[*a]));
+                        }
+                    }
+                    // A forced expert may have had its score zeroed by pruning;
+                    // give it a floor so it actually contributes.
+                    let mut w: Vec<f32> = idx.iter().map(|e| sc[*e].max(0.0)).collect();
                     if s.norm_topk {
                         let z: f32 = w.iter().sum::<f32>().max(1e-20);
                         w.iter_mut().for_each(|v| *v /= z);

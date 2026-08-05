@@ -53,6 +53,10 @@ RUN OPTIONS
       --no-prefetch         stop advising the kernel about the next step's experts
       --pin TRACE.jsonl     keep the experts that trace used resident
       --pin-budget GB       how much to keep resident                  [2]
+      --disable-expert L:E  refuse an expert; L or E may be * for all
+      --force-expert L:E    always select an expert, displacing the weakest
+      --router-temp F       >1 flattens the routing choice, <1 sharpens it
+      --top-k-experts N     experts per token, overriding the checkpoint
 
 SERVE OPTIONS
       --port N              listen port                   [8080]
@@ -340,6 +344,55 @@ fn prompt_ids(args: &Args, tok: Option<&Tokenizer>, bos: Option<u32>) -> Vec<u32
     }
 }
 
+/// Parse `L:E` pairs, where either side may be `*`.
+///
+/// `3:7` is one expert in one layer; `*:7` is expert 7 wherever it appears, which
+/// is the form that answers "what is this expert for" rather than "what is this
+/// one layer doing".
+fn expert_pairs(spec: &str, layers: usize, experts: usize) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (l, e) = item.split_once(':').unwrap_or_else(|| fail(format!("expected LAYER:EXPERT, got '{item}'")));
+        let range = |field: &str, n: usize| -> Vec<u32> {
+            if field == "*" {
+                (0..n as u32).collect()
+            } else {
+                match field.parse::<u32>() {
+                    Ok(v) if (v as usize) < n => vec![v],
+                    Ok(v) => fail(format!("{v} is out of range in '{item}' (0..{n})")),
+                    Err(_) => fail(format!("'{field}' is not a number or *")),
+                }
+            }
+        };
+        for l in range(l, layers) {
+            for e in range(e, experts) {
+                out.push((l, e));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Read the router interventions a run asked for.
+fn routing_of(args: &Args, m: &Model) -> moe::Routing {
+    let pairs = |k: &str| args.get(k).map(|v| expert_pairs(v, m.spec.layers, m.spec.experts)).unwrap_or_default();
+    let r = moe::Routing {
+        disabled: pairs("disable-expert"),
+        forced: pairs("force-expert"),
+        temp: args.num("router-temp", 0.0),
+        top_k: args.num("top-k-experts", 0usize),
+    };
+    if !r.is_empty() && m.spec.experts == 0 {
+        fail("this checkpoint is dense: it has no router to intervene on");
+    }
+    if !r.is_empty() {
+        eprintln!("routing: {}", r.summary());
+    }
+    r
+}
+
 /// Keep the experts a recorded trace used resident, if `--pin` names one.
 ///
 /// This is where `moe route` pays off twice: the trace that showed which experts
@@ -388,6 +441,7 @@ fn run(args: &Args, path: &Path) {
     let t_load = Instant::now();
     let mut m = load(path);
     m.prefetch = !args.on("no-prefetch");
+    m.routing = routing_of(args, &m);
     pin(args, &m);
     let tok = tokenizer_for(args, path, Some(&m.store));
     let ids = prompt_ids(args, tok.as_ref(), m.spec.bos);
@@ -932,7 +986,8 @@ enum Side<'a> {
 /// `moe route <model> -p TEXT [--vs TEXT]` — route a prompt and analyse it in
 /// one step, so seeing where two prompts diverge needs no intermediate files.
 fn route_model(args: &Args, path: &Path) {
-    let m = load(path);
+    let mut m = load(path);
+    m.routing = routing_of(args, &m);
     if m.spec.experts == 0 {
         fail("this checkpoint is dense: it has no routing to analyse");
     }
