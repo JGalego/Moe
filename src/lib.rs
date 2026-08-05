@@ -18,8 +18,10 @@
 //! # }
 //! ```
 
+pub mod draft;
 pub mod eval;
 pub mod fetch;
+pub mod generate;
 pub mod http;
 pub mod model;
 pub mod quant;
@@ -30,8 +32,10 @@ pub mod spec;
 pub mod store;
 pub mod tokenizer;
 
+pub use draft::Lookup;
 pub use eval::Score;
 pub use fetch::{cache_dir, resolve, Source};
+pub use generate::{Outcome, Plan, Stop};
 pub use model::{Model, Route, State, Stats, Trace};
 pub use quant::{Dt, QT};
 pub use route::Counts;

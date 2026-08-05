@@ -6,9 +6,11 @@
 //! instead, which also lets that session keep its KV cache warm between them —
 //! the reason a second chat turn only prefills the message that was added.
 
+use crate::draft::Lookup;
+use crate::generate::{generate, Plan};
 use crate::http::{self, Conn, Request};
 use crate::model::{Model, State};
-use crate::sample::{Rng, Sampler};
+use crate::sample::Sampler;
 use crate::tokenizer::{Stream, Tokenizer};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -128,12 +130,12 @@ pub struct Server {
     pub max_queue: usize,
     prefix_cache: bool,
     pub cors: bool,
+    /// Tokens to draft per step; 0 disables speculation.
+    pub lookahead: usize,
 }
 
 struct Params {
-    max_tokens: usize,
-    sampler: Sampler,
-    seed: u64,
+    plan: Plan,
     stop: Vec<String>,
 }
 
@@ -178,6 +180,7 @@ impl Server {
             max_queue: 32,
             prefix_cache,
             cors: false,
+            lookahead: 0,
         }
     }
 
@@ -198,17 +201,21 @@ impl Server {
             _ => Vec::new(),
         };
         Params {
-            max_tokens: body["max_tokens"].as_u64().unwrap_or(256).min(8192) as usize,
-            sampler: Sampler {
-                temp: f("temperature", 0.0),
-                top_p: f("top_p", 1.0),
-                top_k: body["top_k"].as_u64().unwrap_or(0) as usize,
-                // OpenAI's frequency_penalty is additive; ours is a divisor, so
-                // this is a rough mapping rather than a faithful one.
-                repeat_penalty: 1.0 + f("frequency_penalty", 0.0).max(0.0),
-                ..Sampler::default()
+            plan: Plan {
+                max_tokens: body["max_tokens"].as_u64().unwrap_or(256).min(8192) as usize,
+                sampler: Sampler {
+                    temp: f("temperature", 0.0),
+                    top_p: f("top_p", 1.0),
+                    top_k: body["top_k"].as_u64().unwrap_or(0) as usize,
+                    // OpenAI's frequency_penalty is additive; ours is a divisor, so
+                    // this is a rough mapping rather than a faithful one.
+                    repeat_penalty: 1.0 + f("frequency_penalty", 0.0).max(0.0),
+                    ..Sampler::default()
+                },
+                seed: body["seed"].as_u64().unwrap_or_else(|| now().wrapping_mul(2654435761)),
+                lookahead: self.lookahead,
+                lookup: Lookup::default(),
             },
-            seed: body["seed"].as_u64().unwrap_or_else(|| now().wrapping_mul(2654435761)),
             stop,
         }
     }
@@ -234,11 +241,11 @@ impl Server {
         if prompt.is_empty() {
             return Err("empty prompt".into());
         }
-        if prompt.len() + p.max_tokens > sess.state.ctx {
+        if prompt.len() + p.plan.max_tokens > sess.state.ctx {
             return Err(format!(
                 "prompt of {} tokens plus max_tokens {} exceeds the context window of {}",
                 prompt.len(),
-                p.max_tokens,
+                p.plan.max_tokens,
                 sess.state.ctx
             ));
         }
@@ -250,28 +257,25 @@ impl Server {
             sess.history.extend_from_slice(chunk);
         }
 
-        let mut rng = Rng::new(p.seed);
         let mut text = String::new();
         let mut stream = Stream::default();
         let mut emitted = 0usize;
         let hold = p.stop.iter().map(|s| s.len()).max().unwrap_or(1).saturating_sub(1);
-        let mut out = Gen { text: String::new(), tokens: 0, finish: "length" };
+        let mut hit_stop = false;
+        let Session { state, history } = &mut *sess;
 
-        for _ in 0..p.max_tokens {
-            let next = p.sampler.pick(&mut logits, &sess.history, &mut rng);
-            if self.model.spec.eos.contains(&next) {
-                out.finish = "stop";
-                break;
-            }
-            out.tokens += 1;
+        // Stop sequences live out here rather than in the decode loop: they are
+        // a property of the decoded text, not of the tokens, and returning false
+        // is how the loop is told to end.
+        let outcome = generate(&self.model, state, history, logits, &p.plan, |next| {
             match self.tok.as_ref() {
                 Some(t) => text.push_str(&stream.push(t, next)),
                 None => text.push_str(&format!("{next} ")),
             }
             if let Some(at) = p.stop.iter().filter_map(|s| text.find(s.as_str())).min() {
                 text.truncate(at);
-                out.finish = "stop";
-                break;
+                hit_stop = true;
+                return false;
             }
             // Hold back enough tail that a stop sequence can never be emitted
             // before we have seen all of it.
@@ -280,14 +284,13 @@ impl Server {
                 on_delta(&text[emitted..safe]);
                 emitted = safe;
             }
-            sess.history.push(next);
-            logits = self.model.forward(&[next], &mut sess.state);
-        }
+            true
+        });
         if emitted < text.len() {
             on_delta(&text[emitted..]);
         }
-        out.text = text;
-        Ok(out)
+        let finish = if hit_stop { "stop" } else { outcome.stop.reason() };
+        Ok(Gen { text, tokens: outcome.tokens, finish })
     }
 
     fn completion_body(&self, chat: bool, g: &Gen, prompt_tokens: usize) -> String {

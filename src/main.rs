@@ -43,6 +43,8 @@ RUN OPTIONS
       --no-stream           print only the finished text
       --stats               per-run routing and throughput detail
       --trace PATH          write every routing decision as JSONL
+      --draft N             speculate N tokens per step, 0 = off       [0]
+      --draft-ngram N       longest suffix the drafter matches         [8]
 
 SERVE OPTIONS
       --port N              listen port                   [8080]
@@ -51,6 +53,7 @@ SERVE OPTIONS
       --chat-format NAME    chatml | llama3 | mistral     [detected from vocab]
       --max-queue N         requests allowed to wait before 503     [32]
       --no-prefix-cache     re-prefill every request instead of reusing the cache
+      --draft N             speculate N tokens per step, 0 = off       [0]
       --cors                allow browser origins
 
 ROUTE OPTIONS
@@ -338,7 +341,13 @@ fn run(args: &Args, path: &Path) {
         repeat_penalty: args.num("repeat-penalty", 1.0),
         ..Sampler::default()
     };
-    let mut rng = Rng::new(args.num("seed", 0u64));
+    let plan = moe::Plan {
+        max_tokens: n_gen,
+        sampler,
+        seed: args.num("seed", 0u64),
+        lookahead: args.num("draft", 0usize),
+        lookup: moe::Lookup { max_ngram: args.num("draft-ngram", 8usize).max(1), min_ngram: 2 },
+    };
     let stream = !args.on("no-stream");
 
     if stream {
@@ -350,33 +359,25 @@ fn run(args: &Args, path: &Path) {
     }
 
     let t0 = Instant::now();
-    let mut logits = prefill(&m, &ids, &mut st);
+    let logits = prefill(&m, &ids, &mut st);
     let prefill_s = t0.elapsed().as_secs_f32();
 
     let mut history = ids.clone();
     let mut out = Vec::new();
     let mut text = Stream::default();
     let t1 = Instant::now();
-    for _ in 0..n_gen {
-        let next = sampler.pick(&mut logits, &history, &mut rng);
-        if m.spec.eos.contains(&next) || st.pos >= ctx {
-            break;
-        }
-        history.push(next);
+    let gen = moe::generate::generate(&m, &mut st, &mut history, logits, &plan, |next| {
         out.push(next);
         if stream {
-            if let Some(t) = tok.as_ref() {
-                if !t.is_special(next) {
-                    print!("{}", text.push(t, next));
-                    let _ = std::io::stdout().flush();
-                }
-            } else {
-                print!("{next} ");
-                let _ = std::io::stdout().flush();
+            match tok.as_ref() {
+                Some(t) if !t.is_special(next) => print!("{}", text.push(t, next)),
+                Some(_) => {}
+                None => print!("{next} "),
             }
+            let _ = std::io::stdout().flush();
         }
-        logits = m.forward(&[next], &mut st);
-    }
+        true
+    });
     let decode_s = t1.elapsed().as_secs_f32();
 
     if !stream {
@@ -394,6 +395,17 @@ fn run(args: &Args, path: &Path) {
         out.len() as f32 / decode_s.max(1e-6),
         rss_note(" | "),
     );
+    // Speculation is only worth reporting when it was asked for; the ratio of
+    // tokens to forward steps is the part that turns into wall clock.
+    if plan.lookahead > 0 {
+        eprintln!(
+            "draft {} of {} accepted ({:.0}%) | {:.2} tokens per forward step",
+            gen.accepted,
+            gen.drafted,
+            100.0 * gen.acceptance(),
+            gen.tokens_per_step(),
+        );
+    }
     if let Some(path) = args.get("trace") {
         match write_trace(path, &m, &st, tok.as_ref()) {
             Ok(n) => eprintln!("wrote {n} routing records to {path}"),
@@ -426,6 +438,7 @@ fn serve(args: &Args, path: &Path, spec: &str) {
     let mut server = moe::Server::new(m, tok, chat, name, ctx, !args.on("no-prefix-cache"));
     server.cors = args.on("cors");
     server.max_queue = args.num("max-queue", 32usize).max(1);
+    server.lookahead = args.num("draft", 0usize);
     let host = args.get("host").unwrap_or("127.0.0.1").to_string();
     let port = args.num("port", 8080u16);
     moe::serve::run(server, &host, port).unwrap_or_else(|e| fail(format!("{host}:{port}: {e}")));
