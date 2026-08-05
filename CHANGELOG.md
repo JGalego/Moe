@@ -12,6 +12,8 @@
   between Q4 and Q8. Q5 is laid out as GGUF's `Q5_0`.
 - `pack --hot-experts` gives the experts a trace leans on a finer format than the
   ones it barely touches.
+- `moe info` names the container it read — `safetensors`, `packed` or `gguf` —
+  instead of calling every single-file checkpoint packed.
 
 ### Speed
 
