@@ -355,6 +355,42 @@ impl Model {
 
     /// Run `tokens` starting at `state.pos` and return the logits of the last one.
     pub fn forward(&self, tokens: &[u32], st: &mut State) -> Vec<f32> {
+        let h = self.spec.hidden;
+        let x = self.trunk(tokens, st);
+        self.head(&x[x.len() - h..])
+    }
+
+    /// The same step, but keeping the logits of *every* position.
+    ///
+    /// Scoring text and verifying a speculative draft both need to know what
+    /// the model predicted at each position, not just the last — and both get
+    /// it from one batched step, which is why they cost barely more than a
+    /// single decode. The result is `tokens.len() * vocab`, so callers with a
+    /// long sequence feed it in blocks rather than all at once.
+    pub fn forward_all(&self, tokens: &[u32], st: &mut State) -> Vec<f32> {
+        let (h, vocab) = (self.spec.hidden, self.spec.vocab);
+        let t = tokens.len();
+        let x = self.trunk(tokens, st);
+        let mut nx = vec![0.0f32; t * h];
+        for i in 0..t {
+            rmsnorm(&x[i * h..(i + 1) * h], &self.out_norm, self.spec.eps, &mut nx[i * h..(i + 1) * h]);
+        }
+        let mut logits = vec![0.0f32; t * vocab];
+        matmul(&self.lm_head, &nx, &mut logits);
+        logits
+    }
+
+    /// Final norm plus the unembedding, for one residual-stream row.
+    fn head(&self, last: &[f32]) -> Vec<f32> {
+        let mut nx = vec![0.0f32; self.spec.hidden];
+        rmsnorm(last, &self.out_norm, self.spec.eps, &mut nx);
+        let mut logits = vec![0.0f32; self.spec.vocab];
+        matvec(&self.lm_head, &nx, &mut logits);
+        logits
+    }
+
+    /// Every layer over `tokens`, returning the residual stream (`t * hidden`).
+    fn trunk(&self, tokens: &[u32], st: &mut State) -> Vec<f32> {
         let s = &self.spec;
         let t = tokens.len();
         assert!(t > 0 && st.pos + t <= st.ctx, "context window exhausted");
@@ -388,13 +424,7 @@ impl Model {
             }
         }
         st.pos += t;
-
-        let last = &x[(t - 1) * h..];
-        let mut nx = vec![0.0f32; h];
-        rmsnorm(last, &self.out_norm, s.eps, &mut nx);
-        let mut logits = vec![0.0f32; s.vocab];
-        matvec(&self.lm_head, &nx, &mut logits);
-        logits
+        x
     }
 
     fn attention(&self, layer: &Layer, li: usize, x: &[f32], t: usize, st: &mut State, out: &mut [f32]) {

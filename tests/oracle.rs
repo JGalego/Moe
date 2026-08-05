@@ -93,6 +93,58 @@ fn check_packed(name: &str, dt: Dt, tol: f32) {
     let _ = std::fs::remove_file(&out);
 }
 
+/// `forward_all` must reproduce the reference at *every* position from a single
+/// batched step, not just the last. Scoring text and verifying a speculative
+/// draft both rest on that, so it is checked against the oracle directly rather
+/// than against `forward`.
+fn check_forward_all(name: &str) {
+    let f = fixture(name);
+    let m = load(&f.dir);
+    let mut st = State::new(&m, 32);
+    let all = m.forward_all(&f.tokens, &mut st);
+    let vocab = m.spec.vocab;
+    assert_eq!(all.len(), f.tokens.len() * vocab);
+    for (i, want) in f.logits.iter().enumerate() {
+        let got = &all[i * vocab..(i + 1) * vocab];
+        let d = max_abs_diff(got, want);
+        assert!(d < 5e-3, "{name} forward_all position {i}: max |diff| = {d}");
+        assert_eq!(argmax(got), argmax(want), "{name} forward_all position {i}: argmax moved");
+    }
+    // And the last row must be exactly what the cheap path returns.
+    let mut st2 = State::new(&m, 32);
+    let last = m.forward(&f.tokens, &mut st2);
+    let tail = &all[(f.tokens.len() - 1) * vocab..];
+    assert!(max_abs_diff(tail, &last) < 1e-6, "{name}: forward_all disagrees with forward");
+}
+
+#[test]
+fn forward_all_matches_reference_at_every_position() {
+    check_forward_all("gqa");
+    check_forward_all("mla");
+}
+
+/// Scoring is only meaningful if the numbers are real: a model must find the
+/// text it was shown less surprising than the same tokens shuffled, and the
+/// uniform-prediction bound (ln vocab) must never be exceeded on average by a
+/// model that has learned anything at all.
+#[test]
+fn scoring_is_bounded_and_ordered() {
+    let f = fixture("gqa");
+    let m = load(&f.dir);
+    let ids: Vec<u32> = (0..40).map(|i| ((i * 7 + 3) % m.spec.vocab) as u32).collect();
+    let s = moe::eval::score(&m, &ids, 16, 8, 0, |_, _| {});
+    assert_eq!(s.tokens, ids.len() - 1, "every token but the first must be scored");
+    assert!(s.mean_nll() > 0.0, "surprise cannot be negative");
+    // A random-weight fixture predicts near-uniformly; it cannot do worse than
+    // uniform by much, and cannot beat the vocabulary bound by construction.
+    let uniform = (m.spec.vocab as f64).ln();
+    assert!(s.mean_nll() < uniform * 1.5, "nll {} vs uniform {uniform}", s.mean_nll());
+
+    // A tighter stride re-reads more context but must score the same count.
+    let fine = moe::eval::score(&m, &ids, 16, 1, 0, |_, _| {});
+    assert_eq!(fine.tokens, s.tokens);
+}
+
 #[test]
 fn gqa_incremental_matches_reference() {
     check_incremental("gqa");

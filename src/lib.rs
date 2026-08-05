@@ -18,6 +18,7 @@
 //! # }
 //! ```
 
+pub mod eval;
 pub mod fetch;
 pub mod http;
 pub mod model;
@@ -29,6 +30,7 @@ pub mod spec;
 pub mod store;
 pub mod tokenizer;
 
+pub use eval::Score;
 pub use fetch::{cache_dir, resolve, Source};
 pub use model::{Model, Route, State, Stats, Trace};
 pub use quant::{Dt, QT};

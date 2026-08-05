@@ -16,6 +16,7 @@ USAGE
   moe tokenize <model> -p TEXT       show token ids (--decode 1,2,3 reverses it)
   moe serve <model> [options]        OpenAI-compatible HTTP server
   moe route <model|trace> [options]  analyse which experts the routing selected
+  moe eval  <model> --text PATH      perplexity and bits/byte on held-out text
 
 <model> is any of:
   ./model.moe                        a packed model file
@@ -60,6 +61,15 @@ ROUTE OPTIONS
   -n, --tokens N            also route this many generated tokens    [0]
       --top N               busiest experts to list per layer        [5]
   -o, --out PATH            write the heatmap as SVG
+
+EVAL OPTIONS
+      --text PATH           text to score (- for stdin)
+      --ids 1,2,3           score raw token ids instead
+      --vs MODEL            score a second model on the same tokens and diff
+      --ctx N               window size                   [min(model, 2048)]
+      --stride N            window step; smaller is slower and more accurate
+                                                          [--ctx / 2]
+      --limit N             stop after N tokens           [all]
 
 PACK OPTIONS
   -o, --out PATH            output file                   [./<name>.moe]
@@ -179,6 +189,7 @@ fn main() {
         "tokenize" => tokenize(&args, &path),
         "serve" => serve(&args, &path, &spec),
         "route" => route_model(&args, &path),
+        "eval" => eval(&args, &path),
         other => fail(format!("unknown command '{other}' (try --help)")),
     }
 }
@@ -472,6 +483,98 @@ fn write_trace(path: &str, m: &Model, st: &State, tok: Option<&Tokenizer>) -> st
         writeln!(f, "{line}")?;
     }
     Ok(tr.routes.len())
+}
+
+/// `moe eval <model> --text PATH` — how surprised the model is by text it has
+/// not been given the answer to. With `--vs`, the same tokens through a second
+/// model, which is how a packed file's quality cost gets a number rather than a
+/// compression ratio.
+fn eval(args: &Args, path: &Path) {
+    let m = load(path);
+    let tok = tokenizer_for(args, path, Some(&m.store));
+
+    let (mut ids, bytes) = match (args.get("text"), args.get("ids")) {
+        (Some(src), _) => {
+            let text = if src == "-" {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)
+                    .unwrap_or_else(|e| fail(format!("stdin: {e}")));
+                s
+            } else {
+                std::fs::read_to_string(src).unwrap_or_else(|e| fail(format!("{src}: {e}")))
+            };
+            let t = tok.as_ref().unwrap_or_else(|| fail("no tokenizer found; pass --tokenizer, or give --ids"));
+            (t.encode(&text, m.spec.bos), text.len())
+        }
+        (None, Some(list)) => (list.split(',').filter_map(|s| s.trim().parse().ok()).collect::<Vec<u32>>(), 0),
+        _ => fail("give --text PATH (or - for stdin), or --ids"),
+    };
+    if let Some(limit) = args.get("limit").and_then(|v| v.parse::<usize>().ok()) {
+        ids.truncate(limit);
+    }
+    if ids.len() < 2 {
+        fail("need at least two tokens to score one prediction");
+    }
+
+    let ctx = args.get("ctx").and_then(|v| v.parse().ok()).unwrap_or_else(|| m.spec.max_ctx.min(2048)).max(2);
+    let stride: usize = args.num("stride", (ctx / 2).max(1));
+
+    let report = |label: &str, m: &Model, s: moe::Score, secs: f32| {
+        println!(
+            "{label:<28} ppl {:>8.3}   nll {:.4}   bits/token {:.3}{}\n{:<28} {} tokens in {secs:.1}s ({:.1} tok/s)",
+            s.perplexity(),
+            s.mean_nll(),
+            s.bits_per_token(),
+            if s.bytes > 0 { format!("   bits/byte {:.3}", s.bits_per_byte()) } else { String::new() },
+            "",
+            s.tokens,
+            s.tokens as f32 / secs.max(1e-6),
+        );
+        let _ = m;
+    };
+
+    let run = |m: &Model, label: &str| -> moe::Score {
+        let t0 = Instant::now();
+        let s = moe::eval::score(m, &ids, ctx, stride, bytes, |i, n| {
+            eprint!("\r{label}: window {i}/{n}");
+            let _ = std::io::stderr().flush();
+        });
+        eprint!("\r\x1b[K");
+        report(label, m, s, t0.elapsed().as_secs_f32());
+        s
+    };
+
+    println!("scoring {} tokens, window {ctx}, stride {stride}\n", ids.len());
+    let a = run(&m, &name_of(path));
+    if let Some(other) = args.get("vs") {
+        let p2 = fetched(args, other);
+        let m2 = load(&p2);
+        if m2.spec.vocab != m.spec.vocab {
+            eprintln!(
+                "moe: vocabularies differ ({} vs {}); compare bits/byte, not perplexity",
+                m.spec.vocab, m2.spec.vocab
+            );
+        }
+        let b = run(&m2, &name_of(&p2));
+        // The delta is the whole point of --vs, so state it rather than leaving
+        // it to be read off two lines.
+        println!(
+            "\ndelta                        ppl {:+.3} ({:+.2}%)   nll {:+.4}{}",
+            b.perplexity() - a.perplexity(),
+            100.0 * (b.perplexity() / a.perplexity() - 1.0),
+            b.mean_nll() - a.mean_nll(),
+            if a.bytes > 0 {
+                format!("   bits/byte {:+.4}", b.bits_per_byte() - a.bits_per_byte())
+            } else {
+                String::new()
+            },
+        );
+    }
+}
+
+/// A short display name for a resolved model path.
+fn name_of(p: &Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.display().to_string())
 }
 
 /// The basename of a path, for labelling a diff without its directory.
