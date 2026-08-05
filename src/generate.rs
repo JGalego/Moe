@@ -13,6 +13,7 @@
 //! single-token decode, so speculation is not a second code path.
 
 use crate::draft::Lookup;
+use crate::grammar::Guide;
 use crate::model::{Model, State};
 use crate::sample::{Rng, Sampler};
 
@@ -45,14 +46,20 @@ pub enum Stop {
     Caller,
     /// The context window ran out.
     Context,
+    /// A constraint was satisfied: the document is complete.
+    Complete,
+    /// A constraint left no token that could legally follow. Only reachable if
+    /// the grammar admits no continuation at all, which a satisfiable schema
+    /// cannot do before [`Stop::Complete`].
+    Stuck,
 }
 
 impl Stop {
     /// The `finish_reason` an OpenAI client expects.
     pub fn reason(self) -> &'static str {
         match self {
-            Stop::Length | Stop::Context => "length",
-            Stop::Eos | Stop::Caller => "stop",
+            Stop::Length | Stop::Context | Stop::Stuck => "length",
+            Stop::Eos | Stop::Caller | Stop::Complete => "stop",
         }
     }
 }
@@ -96,6 +103,7 @@ pub fn generate(
     history: &mut Vec<u32>,
     mut logits: Vec<f32>,
     plan: &Plan,
+    mut guide: Option<&mut Guide>,
     mut on_token: impl FnMut(u32) -> bool,
 ) -> Outcome {
     let vocab = m.spec.vocab;
@@ -106,7 +114,14 @@ pub fn generate(
     }
 
     // Commit the first token from the prefill's own logits.
+    if let Some(g) = guide.as_deref_mut() {
+        if g.mask(&mut logits) == 0 {
+            out.stop = Stop::Stuck;
+            return out;
+        }
+    }
     let mut pending = plan.sampler.pick(&mut logits, history, &mut rng);
+    // A constraint masks every control token, so under one this cannot fire.
     if m.spec.eos.contains(&pending) {
         out.stop = Stop::Eos;
         return out;
@@ -120,6 +135,13 @@ pub fn generate(
     if !on_token(pending) {
         out.stop = Stop::Caller;
         return out;
+    }
+    if let Some(g) = guide.as_deref_mut() {
+        g.accept(pending);
+        if g.complete() {
+            out.stop = Stop::Complete;
+            return out;
+        }
     }
 
     let mut row = vec![0.0f32; vocab];
@@ -148,6 +170,15 @@ pub fn generate(
         let mut finish = None;
         while taken < draft.len() {
             row.copy_from_slice(&all[taken * vocab..(taken + 1) * vocab]);
+            // A constraint masks the row before verification, so a draft that
+            // would break the grammar has probability zero and is rejected —
+            // speculation needs no separate rule to stay within the shape.
+            if let Some(g) = guide.as_deref_mut() {
+                if g.mask(&mut row) == 0 {
+                    finish = Some(Stop::Stuck);
+                    break;
+                }
+            }
             match plan.sampler.verify(&mut row, history, draft[taken], &mut rng) {
                 Ok(()) => {
                     let tok = draft[taken];
@@ -162,6 +193,13 @@ pub fn generate(
                     if !on_token(tok) {
                         finish = Some(Stop::Caller);
                         break;
+                    }
+                    if let Some(g) = guide.as_deref_mut() {
+                        g.accept(tok);
+                        if g.complete() {
+                            finish = Some(Stop::Complete);
+                            break;
+                        }
                     }
                     if out.tokens >= plan.max_tokens {
                         finish = Some(Stop::Length);
@@ -189,6 +227,12 @@ pub fn generate(
             Some(t) => t,
             None => {
                 row.copy_from_slice(&all[taken * vocab..(taken + 1) * vocab]);
+                if let Some(g) = guide.as_deref_mut() {
+                    if g.mask(&mut row) == 0 {
+                        out.stop = Stop::Stuck;
+                        return out;
+                    }
+                }
                 plan.sampler.pick(&mut row, history, &mut rng)
             }
         };
@@ -205,6 +249,13 @@ pub fn generate(
         if !on_token(next) {
             out.stop = Stop::Caller;
             return out;
+        }
+        if let Some(g) = guide.as_deref_mut() {
+            g.accept(next);
+            if g.complete() {
+                out.stop = Stop::Complete;
+                return out;
+            }
         }
         pending = next;
     }

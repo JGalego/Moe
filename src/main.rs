@@ -45,6 +45,8 @@ RUN OPTIONS
       --trace PATH          write every routing decision as JSONL
       --draft N             speculate N tokens per step, 0 = off       [0]
       --draft-ngram N       longest suffix the drafter matches         [8]
+      --json                emit only valid JSON, enforced while decoding
+      --schema PATH         emit only JSON matching this JSON Schema
 
 SERVE OPTIONS
       --port N              listen port                   [8080]
@@ -115,7 +117,7 @@ impl Args {
                 .to_string();
                 let flag = matches!(
                     key.as_str(),
-                    "help" | "no-stream" | "stats" | "version" | "offline" | "cors" | "no-prefix-cache"
+                    "help" | "no-stream" | "stats" | "version" | "offline" | "cors" | "no-prefix-cache" | "json"
                 );
                 let val = match inline {
                     Some(v) => v,
@@ -301,6 +303,16 @@ fn prompt_ids(args: &Args, tok: Option<&Tokenizer>, bos: Option<u32>) -> Vec<u32
     }
 }
 
+/// The shape `--json` or `--schema` asks the output to have.
+fn shape_of(args: &Args) -> Option<moe::Grammar> {
+    if let Some(path) = args.get("schema") {
+        let raw = std::fs::read(path).unwrap_or_else(|e| fail(format!("{path}: {e}")));
+        let v = serde_json::from_slice(&raw).unwrap_or_else(|e| fail(format!("{path}: {e}")));
+        return Some(moe::Grammar::from_schema(&v).unwrap_or_else(|e| fail(format!("{path}: {e}"))));
+    }
+    args.on("json").then(moe::Grammar::json)
+}
+
 /// Prefill in blocks so long prompts stay batched without a huge scratch.
 fn prefill(m: &Model, ids: &[u32], st: &mut State) -> Vec<f32> {
     let mut logits = Vec::new();
@@ -349,6 +361,10 @@ fn run(args: &Args, path: &Path) {
         lookup: moe::Lookup { max_ngram: args.num("draft-ngram", 8usize).max(1), min_ngram: 2 },
     };
     let stream = !args.on("no-stream");
+    let mut guide = shape_of(args).map(|g| {
+        let t = tok.as_ref().unwrap_or_else(|| fail("constrained decoding needs a tokenizer to mask against"));
+        moe::Guide::new(g, t)
+    });
 
     if stream {
         if let (Some(t), true) = (tok.as_ref(), args.get("ids").is_none()) {
@@ -366,7 +382,7 @@ fn run(args: &Args, path: &Path) {
     let mut out = Vec::new();
     let mut text = Stream::default();
     let t1 = Instant::now();
-    let gen = moe::generate::generate(&m, &mut st, &mut history, logits, &plan, |next| {
+    let gen = moe::generate::generate(&m, &mut st, &mut history, logits, &plan, guide.as_mut(), |next| {
         out.push(next);
         if stream {
             match tok.as_ref() {

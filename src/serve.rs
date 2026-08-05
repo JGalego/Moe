@@ -8,6 +8,7 @@
 
 use crate::draft::Lookup;
 use crate::generate::{generate, Plan};
+use crate::grammar::{Grammar, Guide};
 use crate::http::{self, Conn, Request};
 use crate::model::{Model, State};
 use crate::sample::Sampler;
@@ -137,6 +138,8 @@ pub struct Server {
 struct Params {
     plan: Plan,
     stop: Vec<String>,
+    /// The shape the answer must have, from `response_format`.
+    shape: Option<Grammar>,
 }
 
 struct Gen {
@@ -217,6 +220,28 @@ impl Server {
                 lookup: Lookup::default(),
             },
             stop,
+            shape: Self::shape_of(&body["response_format"]),
+        }
+    }
+
+    /// `response_format` in the shape OpenAI clients send it: `json_object` for
+    /// any object, `json_schema` for one with a declared shape. An unparseable
+    /// schema leaves the request unconstrained rather than failing it, since
+    /// refusing would be worse than answering in free text.
+    fn shape_of(rf: &Value) -> Option<Grammar> {
+        match rf["type"].as_str()? {
+            "json_object" => Some(Grammar::json()),
+            "json_schema" => {
+                let s = rf["json_schema"].get("schema").unwrap_or(&rf["json_schema"]);
+                match Grammar::from_schema(s) {
+                    Ok(g) => Some(g),
+                    Err(e) => {
+                        eprintln!("moe: response_format schema unusable ({e}); answering unconstrained");
+                        None
+                    }
+                }
+            }
+            _ => None,
         }
     }
 
@@ -262,12 +287,19 @@ impl Server {
         let mut emitted = 0usize;
         let hold = p.stop.iter().map(|s| s.len()).max().unwrap_or(1).saturating_sub(1);
         let mut hit_stop = false;
+        // A shape needs the vocabulary to mask against, so a request asking for
+        // JSON from a checkpoint with no tokenizer beside it cannot be honoured.
+        let mut guide = match (&p.shape, self.tok.as_ref()) {
+            (Some(g), Some(t)) => Some(Guide::new(g.clone(), t)),
+            (Some(_), None) => return Err("response_format needs a tokenizer to constrain against".into()),
+            (None, _) => None,
+        };
         let Session { state, history } = &mut *sess;
 
         // Stop sequences live out here rather than in the decode loop: they are
         // a property of the decoded text, not of the tokens, and returning false
         // is how the loop is told to end.
-        let outcome = generate(&self.model, state, history, logits, &p.plan, |next| {
+        let outcome = generate(&self.model, state, history, logits, &p.plan, guide.as_mut(), |next| {
             match self.tok.as_ref() {
                 Some(t) => text.push_str(&stream.push(t, next)),
                 None => text.push_str(&format!("{next} ")),

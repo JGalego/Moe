@@ -38,7 +38,7 @@ fn run(m: &Model, prompt: &[u32], p: &Plan) -> (Vec<u32>, moe::Outcome) {
     }
     let mut history = prompt.to_vec();
     let mut out = Vec::new();
-    let outcome = generate(m, &mut st, &mut history, logits, p, |t| {
+    let outcome = generate(m, &mut st, &mut history, logits, p, None, |t| {
         out.push(t);
         true
     });
@@ -109,7 +109,7 @@ fn the_cache_matches_the_committed_history_after_speculating() {
         logits = m.forward(chunk, &mut st);
     }
     let mut history = prompt.to_vec();
-    generate(&m, &mut st, &mut history, logits, &p, |_| true);
+    generate(&m, &mut st, &mut history, logits, &p, None, |_| true);
     assert_eq!(st.pos, history.len() - 1, "the last committed token is never forwarded");
 
     // Replay the whole history into a clean state and continue from both; the
@@ -155,7 +155,7 @@ fn the_callback_can_halt_mid_draft() {
     }
     let mut history = prompt.to_vec();
     let mut seen = 0;
-    let o = generate(&m, &mut st, &mut history, logits, &plan(8, 0.0, 20), |_| {
+    let o = generate(&m, &mut st, &mut history, logits, &plan(8, 0.0, 20), None, |_| {
         seen += 1;
         seen < 3
     });
