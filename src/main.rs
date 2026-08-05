@@ -110,6 +110,8 @@ PACK OPTIONS
   -o, --out PATH            output file                   [./<name>.moe]
       --quant FMT           dense weights: q4 q8 f16 f32  [q8]
       --expert-quant FMT    routed experts                [--quant]
+      --keep-experts TRACE  prune to the experts this trace used, per layer
+      --keep N              how many to keep per layer    [top_k x 2]
 
 GLOBAL
       --threads N           worker threads                [all cores]
@@ -284,9 +286,30 @@ fn pack(args: &Args, path: &Path, spec: &str) {
         PathBuf::from(format!("{}.moe", name.trim_end_matches(".moe")))
     });
     let store = Store::open(path).unwrap_or_else(|e| fail(e));
+    // Pruning needs the checkpoint's own shape to know what it is narrowing.
+    let prune = args.get("keep-experts").map(|trace| {
+        let counts = moe::Counts::read(Path::new(trace)).unwrap_or_else(|e| fail(format!("{trace}: {e}")));
+        if counts.is_empty() {
+            fail(format!("{trace}: no routing records to prune from"));
+        }
+        let derived = moe::Spec::derive(&store).unwrap_or_else(|e| fail(e));
+        if derived.experts == 0 {
+            fail("this checkpoint is dense: there are no experts to prune");
+        }
+        let width = args.num("keep", derived.top_k * 2);
+        let plan = counts.prune_plan(derived.layers, width, derived.top_k);
+        println!(
+            "pruning {} experts per layer to {} (from {} tokens of trace; {:.0}% of pairs were used)",
+            derived.experts,
+            plan.width(),
+            counts.tokens,
+            100.0 * counts.coverage(),
+        );
+        plan
+    });
     println!("packing {} -> {} (dense {}, experts {})", path.display(), out.display(), weight.name(), expert.name());
     let t0 = Instant::now();
-    store.pack(&out, weight, expert, |line| println!("{line}")).unwrap_or_else(|e| fail(e));
+    store.pack_pruned(&out, weight, expert, prune.as_ref(), |line| println!("{line}")).unwrap_or_else(|e| fail(e));
     let after = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     println!(
         "done in {:.1}s: {} -> {} ({:.2}x)",

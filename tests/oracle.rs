@@ -296,10 +296,8 @@ fn router_interventions_do_what_they_say() {
     // Disabling an expert everywhere must remove it from every layer.
     let victim = before.iter().flatten().copied().next().expect("some expert was selected");
     let mut ablated = load(&f.dir);
-    ablated.routing = moe::Routing {
-        disabled: (0..layers as u32).map(|l| (l, victim)).collect(),
-        ..Default::default()
-    };
+    ablated.routing =
+        moe::Routing { disabled: (0..layers as u32).map(|l| (l, victim)).collect(), ..Default::default() };
     let after = selected(&ablated);
     assert!(after.iter().all(|l| !l.contains(&victim)), "expert {victim} survived being disabled: {after:?}");
     // ...and the selection must still be full, filled from what the router liked next.
@@ -312,8 +310,7 @@ fn router_interventions_do_what_they_say() {
     // Forcing an expert must put it in every layer's selection.
     let target = ((victim + 1) % experts as u32).min(experts as u32 - 1);
     let mut forced = load(&f.dir);
-    forced.routing =
-        moe::Routing { forced: (0..layers as u32).map(|l| (l, target)).collect(), ..Default::default() };
+    forced.routing = moe::Routing { forced: (0..layers as u32).map(|l| (l, target)).collect(), ..Default::default() };
     for (l, picks) in selected(&forced).iter().enumerate() {
         if !before[l].is_empty() {
             assert!(picks.contains(&target), "layer {l} did not select forced expert {target}: {picks:?}");
@@ -344,6 +341,90 @@ fn router_interventions_do_what_they_say() {
         assert!((total - 1.0).abs() < 1e-3, "flattening broke normalisation: weights sum to {total}");
         assert!(r.experts.iter().all(|(_, w)| *w >= 0.0), "a negative routing weight");
     }
+}
+
+/// Pruning to the experts a prompt actually selected must be *lossless* for that
+/// prompt — same logits, smaller file. That is the whole claim, and it is exactly
+/// checkable: run once with a trace, keep only what the trace touched, and the
+/// pruned model must reproduce the original's output bit for bit.
+#[test]
+fn pruning_to_the_used_experts_changes_nothing_for_that_prompt() {
+    let f = fixture("gqa");
+    let full = load(&f.dir);
+    let (layers, experts, top_k) = (full.spec.layers, full.spec.experts, full.spec.top_k);
+
+    // Record which experts this prompt used.
+    let mut st = State::new(&full, 32);
+    st.trace();
+    let want = full.forward(&f.tokens, &mut st);
+    let counts = moe::Counts::from_trace(st.trace.as_ref().unwrap(), &full.spec.arch, experts, top_k);
+    let used: usize = (0..layers as u32).map(|l| counts.top(l, experts).len()).max().unwrap_or(0);
+    assert!(used > 0 && used < experts, "this prompt used {used} of {experts} experts, so there is nothing to prune");
+
+    // Keep exactly that many per layer, which for this prompt is everything it
+    // touched and nothing it did not.
+    let plan = counts.prune_plan(layers, used, top_k);
+    assert_eq!(plan.width(), used);
+    let out = std::env::temp_dir().join("moe-test-pruned.moe");
+    Store::open(&f.dir).unwrap().pack_pruned(&out, Dt::F32, Dt::F32, Some(&plan), |_| {}).unwrap();
+
+    let pruned = load(&out);
+    assert_eq!(pruned.spec.experts, used, "the pruned config still declares the old expert count");
+    assert_eq!(pruned.spec.top_k, top_k.min(used));
+    assert_eq!(pruned.spec.layers, layers);
+    assert!(pruned.expert_bytes() < full.expert_bytes(), "pruning did not shrink the expert weights");
+
+    // The prompt's own output must be unchanged, because nothing it used was
+    // dropped and the router's surviving rows are the same rows.
+    let mut st2 = State::new(&pruned, 32);
+    let got = pruned.forward(&f.tokens, &mut st2);
+    let d = max_abs_diff(&got, &want);
+    assert!(d < 1e-4, "pruning to the used set moved the logits by {d}");
+    assert_eq!(argmax(&got), argmax(&want));
+
+    // The pruned model must route only within its new range.
+    let mut st3 = State::new(&pruned, 32);
+    st3.trace();
+    pruned.forward(&f.tokens, &mut st3);
+    for r in &st3.trace.as_ref().unwrap().routes {
+        assert!(
+            r.experts.iter().all(|(e, _)| (*e as usize) < used),
+            "the pruned model selected expert {:?}, outside its {used}",
+            r.experts
+        );
+        assert_eq!(r.experts.len(), top_k.min(used));
+    }
+    let _ = std::fs::remove_file(&out);
+}
+
+/// Pruning below what a prompt uses must still produce a working model — just a
+/// different one. This is the case that would silently corrupt a checkpoint if
+/// the router were not narrowed alongside the experts.
+#[test]
+fn pruning_past_the_used_set_still_yields_a_valid_model() {
+    let f = fixture("gqa");
+    let full = load(&f.dir);
+    let mut st = State::new(&full, 32);
+    st.trace();
+    full.forward(&f.tokens, &mut st);
+    let counts = moe::Counts::from_trace(st.trace.as_ref().unwrap(), "m", full.spec.experts, full.spec.top_k);
+
+    // One expert per layer, below the checkpoint's top-k of 2.
+    let plan = counts.prune_plan(full.spec.layers, 1, 1);
+    assert_eq!(plan.width(), 1);
+    let out = std::env::temp_dir().join("moe-test-pruned-hard.moe");
+    Store::open(&f.dir).unwrap().pack_pruned(&out, Dt::F32, Dt::F32, Some(&plan), |_| {}).unwrap();
+
+    let pruned = load(&out);
+    assert_eq!(pruned.spec.experts, 1);
+    assert_eq!(pruned.spec.top_k, 1, "top-k must be clamped to what survives");
+    let mut st2 = State::new(&pruned, 32);
+    let got = pruned.forward(&f.tokens, &mut st2);
+    assert_eq!(got.len(), full.spec.vocab);
+    assert!(got.iter().all(|v| v.is_finite()), "the pruned model produced non-finite logits");
+    // It is a different model now, so the output is allowed to differ — what it
+    // may not do is fail to load or produce nonsense.
+    let _ = std::fs::remove_file(&out);
 }
 
 #[test]

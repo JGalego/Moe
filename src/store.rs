@@ -260,14 +260,39 @@ impl Store {
     /// 2-D weights whose width is a multiple of the block size go to `weight_dt`
     /// (experts to `expert_dt`); norms, biases and router gates stay f32, where
     /// they cost nothing and quantisation noise would be amplified.
-    pub fn pack(&self, out: &Path, weight_dt: Dt, expert_dt: Dt, mut log: impl FnMut(&str)) -> io::Result<()> {
+    pub fn pack(&self, out: &Path, weight_dt: Dt, expert_dt: Dt, log: impl FnMut(&str)) -> io::Result<()> {
+        self.pack_pruned(out, weight_dt, expert_dt, None, log)
+    }
+
+    /// Re-quantise into a packed `.moe`, optionally keeping only some experts.
+    ///
+    /// With a [`Prune`], each MoE layer keeps the experts it names, renumbered
+    /// into a contiguous range, and the router is narrowed to match. The result is
+    /// a smaller, self-consistent model rather than a checkpoint with holes in it:
+    /// nothing dangling, nothing that can select an expert that is no longer
+    /// there.
+    pub fn pack_pruned(
+        &self,
+        out: &Path,
+        weight_dt: Dt,
+        expert_dt: Dt,
+        prune: Option<&Prune>,
+        mut log: impl FnMut(&str),
+    ) -> io::Result<()> {
         let mut tensors = serde_json::Map::new();
-        let mut plan: Vec<(String, Rec, Dt)> = Vec::new();
+        let mut plan: Vec<Item> = Vec::new();
         let mut off = 0u64;
         for (name, r) in &self.index {
             if name.contains("rotary_emb") || name.ends_with(".inv_freq") {
                 continue;
             }
+            // Pruning renames, re-slices or drops a tensor; everything else is
+            // copied straight through.
+            let (dest, rows, cols, shape_override) = match prune.map(|p| p.plan(name, r)) {
+                Some(Selection::Drop) => continue,
+                Some(Selection::Keep { name, rows, cols, slabs }) => (name, rows, cols, slabs),
+                None => (name.clone(), None, None, None),
+            };
             let target = if r.rows == 1 || !is_big_weight(name) {
                 Dt::F32
             } else if is_expert(name) {
@@ -276,10 +301,20 @@ impl Store {
                 weight_dt
             };
             let dt = if target.fits(r.cols) { target } else { Dt::F32 };
-            let len = (r.slabs * r.rows * dt.row_bytes(r.cols)) as u64;
-            let shape = if r.slabs > 1 { json!([r.slabs, r.rows, r.cols]) } else { json!([r.rows, r.cols]) };
-            tensors.insert(name.clone(), json!({"dt": dt.name(), "shape": shape, "off": off, "len": len}));
-            plan.push((name.clone(), *r, dt));
+            let out_cols = cols.as_ref().map(|c| c.len()).unwrap_or(r.cols);
+            // A narrowed row may no longer be a whole number of blocks.
+            let dt = if dt.fits(out_cols) { dt } else { Dt::F32 };
+            let out_rows = rows.as_ref().map(|v| v.len()).unwrap_or(r.slabs * r.rows);
+            let len = (out_rows * dt.row_bytes(out_cols)) as u64;
+            let shape = match shape_override {
+                // A fused expert stack keeps its three dimensions, with a
+                // narrower leading one.
+                Some(slabs) => json!([slabs, out_rows / slabs.max(1), out_cols]),
+                None if r.slabs > 1 => json!([r.slabs, r.rows, out_cols]),
+                None => json!([out_rows, out_cols]),
+            };
+            tensors.insert(dest.clone(), json!({"dt": dt.name(), "shape": shape, "off": off, "len": len}));
+            plan.push(Item { dest, src: name.clone(), rec: *r, dt, rows, cols });
             off += len;
         }
         // Carry the tokenizer along so the packed model needs nothing beside it.
@@ -296,8 +331,14 @@ impl Store {
             .or_else(|| chat_template_in(&self.path))
             .map(Value::String)
             .unwrap_or(Value::Null);
+        // The config has to agree with the tensors, or the pruned model would
+        // detect an expert count it no longer has.
+        let mut config = self.config.clone();
+        if let Some(p) = prune {
+            p.rewrite(&mut config);
+        }
         let header = json!({
-            "config": self.config,
+            "config": config,
             "tokenizer": tokenizer,
             "chat_template": chat,
             "tensors": Value::Object(tensors),
@@ -311,21 +352,182 @@ impl Store {
         f.write_all(&hbytes)?;
 
         let total = plan.len();
-        let (mut src, mut dst) = (Vec::new(), Vec::new());
-        for (i, (name, r, dt)) in plan.iter().enumerate() {
-            let t = self.get(name).unwrap();
+        let (mut src, mut dst, mut narrowed) = (Vec::new(), Vec::new(), Vec::new());
+        for (i, item) in plan.iter().enumerate() {
+            let t = self.get(&item.src).unwrap();
+            let r = &item.rec;
             src.resize(r.cols, 0.0);
-            dst.resize(dt.row_bytes(r.cols), 0);
-            for row in 0..r.slabs * r.rows {
-                t.dequant_row(row, &mut src);
-                quantize(*dt, &src, &mut dst);
+            let out_cols = item.cols.as_ref().map(|c| c.len()).unwrap_or(r.cols);
+            narrowed.resize(out_cols, 0.0);
+            dst.resize(item.dt.row_bytes(out_cols), 0);
+            let all: Vec<usize> = (0..r.slabs * r.rows).collect();
+            let rows = item.rows.as_deref().unwrap_or(&all);
+            for row in rows {
+                t.dequant_row(*row, &mut src);
+                let row_data: &[f32] = match &item.cols {
+                    Some(keep) => {
+                        for (o, c) in narrowed.iter_mut().zip(keep) {
+                            *o = src[*c];
+                        }
+                        &narrowed
+                    }
+                    None => &src,
+                };
+                quantize(item.dt, row_data, &mut dst);
                 f.write_all(&dst)?;
             }
             if i % 64 == 0 || i + 1 == total {
-                log(&format!("  [{:>5}/{}] {name} -> {}", i + 1, total, dt.name()));
+                log(&format!("  [{:>5}/{}] {} -> {}", i + 1, total, item.dest, item.dt.name()));
             }
         }
         f.flush()
+    }
+}
+
+/// One tensor's write plan: where it comes from, what it is called, and which
+/// rows and columns of it survive.
+struct Item {
+    dest: String,
+    src: String,
+    rec: Rec,
+    dt: Dt,
+    /// Rows of the flattened source to write, in order. `None` means all.
+    rows: Option<Vec<usize>>,
+    /// Columns to keep. `None` means all.
+    cols: Option<Vec<usize>>,
+}
+
+/// What pruning does to one tensor.
+enum Selection {
+    Drop,
+    Keep { name: String, rows: Option<Vec<usize>>, cols: Option<Vec<usize>>, slabs: Option<usize> },
+}
+
+/// Which experts each layer keeps.
+///
+/// A sparse checkpoint is mostly experts a given workload never selects, and
+/// `moe route` says exactly which. Dropping the rest yields a smaller model
+/// specialised to that workload — Mixtral, but only the parts that answer code
+/// questions. The count has to be uniform across layers because a config
+/// declares one expert count, but the *sets* differ per layer, which is where the
+/// specialisation lives.
+#[derive(Clone, Debug)]
+pub struct Prune {
+    /// `keep[layer]` is the experts to retain, ascending. Their position here is
+    /// the index they are renumbered to.
+    pub keep: Vec<Vec<u32>>,
+    /// Experts per token in the pruned model, which cannot exceed what is kept.
+    pub top_k: usize,
+}
+
+impl Prune {
+    /// How many experts each layer will have. Uniform by construction.
+    pub fn width(&self) -> usize {
+        self.keep.iter().map(|k| k.len()).max().unwrap_or(0)
+    }
+
+    /// Which layer a per-layer tensor name belongs to, and where its suffix starts.
+    fn layer_of(name: &str) -> Option<(usize, usize)> {
+        // `...layers.<n>.rest` — find the number between two dots.
+        let bytes = name.as_bytes();
+        let mut i = 0;
+        while let Some(dot) = name[i..].find('.') {
+            let start = i + dot + 1;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start && bytes.get(end) == Some(&b'.') {
+                if let Ok(l) = name[start..end].parse() {
+                    return Some((l, end + 1));
+                }
+            }
+            i = start;
+        }
+        None
+    }
+
+    fn kept(&self, layer: usize) -> Option<&Vec<u32>> {
+        self.keep.get(layer).filter(|k| !k.is_empty())
+    }
+
+    fn plan(&self, name: &str, r: &Rec) -> Selection {
+        let keep_all = || Selection::Keep { name: name.to_string(), rows: None, cols: None, slabs: None };
+        let Some((layer, at)) = Prune::layer_of(name) else { return keep_all() };
+        let Some(keep) = self.kept(layer) else { return keep_all() };
+        let suffix = &name[at..];
+
+        // The router: one row per expert, so narrow it to the kept rows in the
+        // same order the experts were renumbered.
+        if suffix.ends_with("mlp.gate.weight") || suffix.ends_with("block_sparse_moe.gate.weight") {
+            return Selection::Keep {
+                name: name.to_string(),
+                rows: Some(keep.iter().map(|e| *e as usize).collect()),
+                cols: None,
+                slabs: None,
+            };
+        }
+        // The gate's per-expert bias is a single row indexed by expert, so the
+        // selection is over columns instead.
+        if suffix.contains("e_score_correction_bias") {
+            return Selection::Keep {
+                name: name.to_string(),
+                rows: None,
+                cols: Some(keep.iter().map(|e| *e as usize).collect()),
+                slabs: None,
+            };
+        }
+        // A fused stack: keep whole slabs, in the new order.
+        if suffix.starts_with("mlp.experts.") && r.slabs > 1 {
+            let rows: Vec<usize> =
+                keep.iter().flat_map(|e| (0..r.rows).map(move |row| *e as usize * r.rows + row)).collect();
+            return Selection::Keep { name: name.to_string(), rows: Some(rows), cols: None, slabs: Some(keep.len()) };
+        }
+        // Per-expert tensors: drop the unwanted, renumber the rest.
+        for marker in ["mlp.experts.", "block_sparse_moe.experts."] {
+            if let Some(rest) = suffix.strip_prefix(marker) {
+                let (num, tail) = rest.split_once('.').unwrap_or((rest, ""));
+                if let Ok(e) = num.parse::<u32>() {
+                    return match keep.iter().position(|k| *k == e) {
+                        Some(new) => Selection::Keep {
+                            name: format!("{}{marker}{new}.{tail}", &name[..at]),
+                            rows: None,
+                            cols: None,
+                            slabs: None,
+                        },
+                        None => Selection::Drop,
+                    };
+                }
+            }
+        }
+        keep_all()
+    }
+
+    /// Bring the config into line with the tensors that were written.
+    fn rewrite(&self, config: &mut Value) {
+        let width = self.width();
+        if width == 0 {
+            return;
+        }
+        if let Some(obj) = config.as_object_mut() {
+            for key in ["num_experts", "n_routed_experts", "num_local_experts", "moe_num_experts"] {
+                if obj.contains_key(key) {
+                    obj.insert(key.into(), json!(width));
+                }
+            }
+            for key in ["num_experts_per_tok", "moe_top_k"] {
+                if obj.contains_key(key) {
+                    obj.insert(key.into(), json!(self.top_k.min(width)));
+                }
+            }
+            // Group-limited routing cannot survive renumbering: the groups were
+            // contiguous ranges of the original experts, and are no longer.
+            for key in ["n_group", "topk_group"] {
+                if obj.contains_key(key) {
+                    obj.insert(key.into(), json!(1));
+                }
+            }
+        }
     }
 }
 

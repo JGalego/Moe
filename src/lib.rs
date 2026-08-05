@@ -46,7 +46,7 @@ pub use route::Counts;
 pub use sample::{Rng, Sampler};
 pub use serve::{ChatFormat, Server};
 pub use spec::Spec;
-pub use store::Store;
+pub use store::{Prune, Store};
 pub use tokenizer::Tokenizer;
 
 /// Peak resident set size in bytes, or 0 where the OS does not report it.

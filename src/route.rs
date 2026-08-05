@@ -173,6 +173,35 @@ impl Counts {
         v.into_iter().map(|(k, _)| *k).collect()
     }
 
+    /// A pruning plan keeping the `width` busiest experts in each layer.
+    ///
+    /// Every layer keeps the same *number*, because a config declares one expert
+    /// count, but the sets differ — which is where the specialisation lives. A
+    /// layer the trace barely exercised is topped up with its lowest-numbered
+    /// unused experts, so the shape stays uniform rather than the model becoming
+    /// unloadable.
+    pub fn prune_plan(&self, layers: usize, width: usize, top_k: usize) -> crate::store::Prune {
+        let width = width.clamp(top_k.max(1), self.experts.max(1));
+        let keep = (0..layers)
+            .map(|l| {
+                let l = l as u32;
+                let mut chosen: Vec<u32> = self.top(l, width).into_iter().map(|(e, _)| e).collect();
+                // Top up with unused experts so every layer is the same width.
+                for e in 0..self.experts as u32 {
+                    if chosen.len() >= width {
+                        break;
+                    }
+                    if !chosen.contains(&e) {
+                        chosen.push(e);
+                    }
+                }
+                chosen.sort_unstable();
+                chosen
+            })
+            .collect();
+        crate::store::Prune { keep, top_k }
+    }
+
     /// Strongest `n` experts in a layer, share-descending.
     pub fn top(&self, layer: u32, n: usize) -> Vec<(u32, f32)> {
         let mut v: Vec<(u32, f32)> =
