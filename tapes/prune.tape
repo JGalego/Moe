@@ -1,5 +1,5 @@
 # Trace a domain, then keep only the experts it reaches.
-#   moe pull allenai/OLMoE-1B-7B-0924
+#   moe pull allenai/OLMoE-1B-7B-0924-Instruct
 #   vhs tapes/prune.tape
 Source common.tape
 Output assets/prune.gif
@@ -12,12 +12,12 @@ Type "CODE='def merge(a, b): return {**a, **b}  # dict union, py3.5+'" Enter
 Type "clear" Enter
 Show
 
-Type "moe run allenai/OLMoE-1B-7B-0924 -p \"$CODE\" -n 48 --trace code.jsonl --no-stream"
+Type "moe run allenai/OLMoE-1B-7B-0924-Instruct -p \"$CODE\" -n 48 --trace code.jsonl --no-stream"
 Sleep 700ms
 Enter
 Sleep 20s
 
-Type "moe pack allenai/OLMoE-1B-7B-0924 --quant q8 --expert-quant q4 \"
+Type "moe pack allenai/OLMoE-1B-7B-0924-Instruct --quant q8 --expert-quant q4 \"
 Enter
 Type "  --keep-experts code.jsonl --keep 16 -o olmoe-code.moe | tail -3"
 Sleep 700ms

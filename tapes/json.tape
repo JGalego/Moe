@@ -1,5 +1,5 @@
 # Constrained decoding: the model cannot emit anything but this shape.
-#   moe pull allenai/OLMoE-1B-7B-0924
+#   moe pull allenai/OLMoE-1B-7B-0924-Instruct
 #   vhs tapes/json.tape
 Source common.tape
 Output assets/json.gif
@@ -21,7 +21,7 @@ Sleep 500ms
 Enter
 Sleep 1500ms
 
-Type "moe run allenai/OLMoE-1B-7B-0924 --schema person.json -n 40 \"
+Type "moe run allenai/OLMoE-1B-7B-0924-Instruct --schema person.json -n 40 \"
 Enter
 Type "  -p 'Ada Lovelace, 36, an administrator. As JSON: '"
 Sleep 700ms

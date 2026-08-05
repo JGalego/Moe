@@ -1,5 +1,5 @@
 # Architecture detected from the checkpoint, before and after packing.
-#   moe pack allenai/OLMoE-1B-7B-0924 --quant q8 --expert-quant q4 -o olmoe.moe
+#   moe pack allenai/OLMoE-1B-7B-0924-Instruct --quant q8 --expert-quant q4 -o olmoe.moe
 #   vhs tapes/info.tape
 Source common.tape
 Output assets/info.gif
@@ -10,7 +10,7 @@ Hide
 Type "PS1='$ ' && clear" Enter
 Show
 
-Type "moe info allenai/OLMoE-1B-7B-0924"
+Type "moe info allenai/OLMoE-1B-7B-0924-Instruct"
 Sleep 700ms
 Enter
 Sleep 2500ms

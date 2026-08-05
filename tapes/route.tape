@@ -1,5 +1,5 @@
 # Where a model sends code versus prose — the routing analysis, in the binary.
-#   moe pull allenai/OLMoE-1B-7B-0924   (once, before recording)
+#   moe pull allenai/OLMoE-1B-7B-0924-Instruct   (once, before recording)
 #   vhs tapes/route.tape
 Source common.tape
 Output assets/route.gif
@@ -10,7 +10,7 @@ Hide
 Type "PS1='$ ' && clear" Enter
 Show
 
-Type "moe route allenai/OLMoE-1B-7B-0924 --top 3 \"
+Type "moe route allenai/OLMoE-1B-7B-0924-Instruct --top 3 \"
 Enter
 Type "  -p 'def parse(xs): return [int(x) for x in xs.split()]' \"
 Enter

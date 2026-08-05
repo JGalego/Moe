@@ -20,8 +20,13 @@ pub enum Source {
 }
 
 /// Files worth downloading from a Hub repo, in the absence of a packed model.
+///
+/// `tokenizer_config.json` and `chat_template.jinja` are here because a
+/// checkpoint's prompt format lives in one or the other, and a format that is
+/// never downloaded is a format the engine silently falls back from. They are a
+/// few kilobytes next to gigabytes of weights.
 #[cfg(feature = "fetch")]
-const WANTED: [&str; 2] = ["config.json", "tokenizer.json"];
+const WANTED: [&str; 4] = ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"];
 
 /// Classify a model spec. Anything that exists on disk wins; after that a bare
 /// `owner/name` is a repo id, which is why `hf:` exists to force the issue.
@@ -330,6 +335,22 @@ mod net {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Hub download must bring the files the engine reads, and no more. The
+    /// prompt format lives in `tokenizer_config.json`, and leaving it behind
+    /// makes the chat template silently unavailable — the checkpoint appears to
+    /// declare no format, and the engine falls back to guessing one.
+    #[cfg(feature = "fetch")]
+    #[test]
+    fn the_download_list_covers_the_prompt_format() {
+        assert!(WANTED.contains(&"config.json"), "architecture detection needs it");
+        assert!(WANTED.contains(&"tokenizer.json"), "text in and out needs it");
+        assert!(WANTED.contains(&"tokenizer_config.json"), "the chat template lives here");
+        assert!(WANTED.contains(&"chat_template.jinja"), "...or here, in the newer convention");
+        // Everything else in a repo is weights, conversions or demos, which are
+        // picked by extension rather than by name.
+        assert!(WANTED.iter().all(|w| w.ends_with(".json") || w.ends_with(".jinja")));
+    }
 
     #[test]
     fn specs_are_classified() {
