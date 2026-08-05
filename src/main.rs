@@ -60,6 +60,7 @@ SERVE OPTIONS
       --chat-format NAME    chatml | llama3 | mistral     [detected from vocab]
       --max-queue N         requests allowed to wait before 503     [32]
       --no-prefix-cache     re-prefill every request instead of reusing the cache
+      --slots N             prefix caches to keep warm; one KV cache each   [1]
       --draft N             speculate N tokens per step, 0 = off       [0]
       --no-prefetch         stop advising the kernel about the next step's experts
       --pin TRACE.jsonl     keep the experts that trace used resident
@@ -513,6 +514,7 @@ fn serve(args: &Args, path: &Path, spec: &str) {
     server.cors = args.on("cors");
     server.max_queue = args.num("max-queue", 32usize).max(1);
     server.lookahead = args.num("draft", 0usize);
+    server.slots(args.num("slots", 1usize));
     if let Some(p) = args.get("pool") {
         server.pool = moe::Pool::parse(p).unwrap_or_else(|| fail(format!("unknown pooling '{p}' (mean, last, first)")));
     }

@@ -299,6 +299,68 @@ fn metrics_count_the_work_done() {
     assert!(count(&get(port, "/metrics"), "moe_prefix_cache_tokens_reused_total") > 0);
 }
 
+/// Two conversations taking turns must both stay warm.
+///
+/// With one slot each request evicts the other and nothing is ever reused; with
+/// two, every request after the first two continues from its own cache. That
+/// difference is the whole feature, and it is visible in the counters.
+#[test]
+fn alternating_conversations_each_keep_their_own_cache() {
+    let a: Vec<u32> = vec![1, 2, 3, 4, 5];
+    let b: Vec<u32> = vec![9, 8, 7, 6, 5];
+
+    let reused = |slots: usize| -> u64 {
+        let mut server = Server::new(model(), None, None, "fixture".into(), 64, true);
+        server.slots(slots);
+        let listener = http::bind("127.0.0.1", 0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::sync::Arc::new(server);
+        std::thread::spawn(move || http::run(listener, move |req, conn| server.handle(req, conn)));
+
+        // Alternate, extending each conversation as it goes.
+        for turn in 0..3 {
+            for base in [&a, &b] {
+                let mut prompt = base.clone();
+                prompt.extend((0..turn).map(|i| 20 + i as u32));
+                completion(port, &prompt, 2);
+            }
+        }
+        let text = get(port, "/metrics");
+        text.lines()
+            .find(|l| l.starts_with("moe_prefix_cache_tokens_reused_total") && !l.starts_with('#'))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("no reuse counter in {text}"))
+    };
+
+    let one = reused(1);
+    let two = reused(2);
+    assert!(two > one, "two slots reused {two} tokens, one slot reused {one} — the pool bought nothing");
+    assert_eq!(one, 0, "with a single slot the two conversations should evict each other");
+}
+
+/// A pool must not change any answer. Whichever slot a prompt lands in, the
+/// tokens have to be the ones the engine produces from a clean state.
+#[test]
+fn a_pool_does_not_change_the_output() {
+    let mut server = Server::new(model(), None, None, "fixture".into(), 64, true);
+    server.slots(4);
+    let listener = http::bind("127.0.0.1", 0).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::sync::Arc::new(server);
+    std::thread::spawn(move || http::run(listener, move |req, conn| server.handle(req, conn)));
+
+    let prompts: Vec<Vec<u32>> = vec![vec![1, 2, 3], vec![7, 7, 7], vec![4, 5], vec![9, 1, 2, 3], vec![1, 2, 3]];
+    // Twice around, so the second lap is served from warm slots.
+    for _ in 0..2 {
+        for p in &prompts {
+            let got = completion(port, p, 4);
+            let want = engine_reference(p, 4);
+            assert_eq!(got, want, "prompt {p:?} answered differently through the pool");
+        }
+    }
+}
+
 #[test]
 fn bad_requests_are_refused_not_crashed() {
     let port = boot(true);

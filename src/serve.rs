@@ -120,6 +120,8 @@ struct Session {
     state: State,
     /// Token ids that produced the cache as it stands.
     history: Vec<u32>,
+    /// When this slot was last used, for eviction. A counter, not a clock.
+    used: u64,
 }
 
 /// How a chat turn becomes a prompt: the checkpoint's own template if it ships
@@ -191,6 +193,8 @@ pub struct Metrics {
     drafted: AtomicU64,
     accepted: AtomicU64,
     steps: AtomicU64,
+    /// Requests that found a warm slot to continue from.
+    cache_hits: AtomicU64,
 }
 
 impl Metrics {
@@ -198,6 +202,9 @@ impl Metrics {
         self.prompt_tokens.fetch_add(prompt as u64, Ordering::Relaxed);
         self.completion_tokens.fetch_add(o.tokens as u64, Ordering::Relaxed);
         self.reused_tokens.fetch_add(reused as u64, Ordering::Relaxed);
+        if reused > 0 {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        }
         self.drafted.fetch_add(o.drafted as u64, Ordering::Relaxed);
         self.accepted.fetch_add(o.accepted as u64, Ordering::Relaxed);
         self.steps.fetch_add(o.steps as u64, Ordering::Relaxed);
@@ -205,7 +212,7 @@ impl Metrics {
 
     /// The Prometheus text exposition format, written by hand because it is six
     /// lines of it and a dependency would be larger than the feature.
-    fn render(&self, queued: usize) -> String {
+    fn render(&self, queued: usize, slots: usize) -> String {
         let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
         let mut out = String::new();
         for (name, help, kind, value) in [
@@ -223,7 +230,14 @@ impl Metrics {
             ("moe_draft_tokens_total", "Tokens proposed by the drafter.", "counter", g(&self.drafted)),
             ("moe_draft_accepted_total", "Drafted tokens the model agreed with.", "counter", g(&self.accepted)),
             ("moe_forward_steps_total", "Forward passes run while decoding.", "counter", g(&self.steps)),
+            (
+                "moe_prefix_cache_hits_total",
+                "Requests that continued from a warm slot.",
+                "counter",
+                g(&self.cache_hits),
+            ),
             ("moe_queued_requests", "Requests waiting on the session.", "gauge", queued as u64),
+            ("moe_prefix_cache_slots", "Prefix caches held.", "gauge", slots as u64),
         ] {
             out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"));
         }
@@ -236,7 +250,11 @@ pub struct Server {
     tok: Option<Tokenizer>,
     chat: Option<Prompting>,
     name: String,
-    session: Mutex<Session>,
+    /// The prefix-cache pool. One mutex over all of it, because generation is
+    /// serial anyway — the pool exists to keep several conversations warm, not
+    /// to run them at once.
+    session: Mutex<Vec<Session>>,
+    clock: AtomicU64,
     queued: AtomicUsize,
     pub max_queue: usize,
     prefix_cache: bool,
@@ -296,7 +314,8 @@ impl Server {
             tok,
             chat,
             name,
-            session: Mutex::new(Session { state, history: Vec::new() }),
+            session: Mutex::new(vec![Session { state, history: Vec::new(), used: 0 }]),
+            clock: AtomicU64::new(1),
             queued: AtomicUsize::new(0),
             max_queue: 32,
             prefix_cache,
@@ -309,6 +328,27 @@ impl Server {
 
     pub fn chat_format(&self) -> Option<&Prompting> {
         self.chat.as_ref()
+    }
+
+    /// Size the prefix-cache pool.
+    ///
+    /// One slot means a second conversation evicts the first, so two clients
+    /// taking turns each re-prefill everything. Several slots mean an arriving
+    /// prompt can find the cache that already holds its history. The cost is
+    /// exact and worth stating: one full KV cache per slot, which `moe info`
+    /// reports per thousand tokens.
+    pub fn slots(&mut self, n: usize) {
+        let ctx = match self.session.lock() {
+            Ok(s) => s.first().map(|s| s.state.ctx).unwrap_or(0),
+            Err(_) => return,
+        };
+        let extra: Vec<Session> = (1..n.max(1))
+            .map(|_| Session { state: State::new(&self.model, ctx), history: Vec::new(), used: 0 })
+            .collect();
+        if let Ok(mut slots) = self.session.lock() {
+            slots.truncate(n.max(1));
+            slots.extend(extra);
+        }
     }
 
     fn encode(&self, text: &str, bos: bool) -> Result<Vec<u32>, String> {
@@ -374,37 +414,50 @@ impl Server {
         }
     }
 
-    /// Reuse whatever of `want` the cache already holds, and return how much.
-    fn rewind(&self, sess: &mut Session, want: &[u32]) -> usize {
+    /// Choose the slot that needs the least prefilling, and rewind it to the
+    /// prefix it shares with `want`. Returns `(slot, tokens reused)`.
+    fn claim(&self, slots: &mut [Session], want: &[u32]) -> (usize, usize) {
         if !self.prefix_cache {
-            sess.state.reset();
-            sess.history.clear();
-            return 0;
+            slots[0].state.reset();
+            slots[0].history.clear();
+            return (0, 0);
         }
-        let common = want.iter().zip(&sess.history).take_while(|(a, b)| a == b).count();
+        let shared = |s: &Session| want.iter().zip(&s.history).take_while(|(a, b)| a == b).count();
+        let best = slots.iter().enumerate().map(|(i, s)| (i, shared(s))).max_by_key(|(_, n)| *n);
+        let (idx, common) = match best {
+            // Nothing to reuse anywhere, so take the coldest slot rather than
+            // evicting a conversation that may come back.
+            Some((_, 0)) | None => {
+                let lru = slots.iter().enumerate().min_by_key(|(_, s)| s.used).map(|(i, _)| i).unwrap_or(0);
+                (lru, 0)
+            }
+            Some(hit) => hit,
+        };
         // Always leave at least one token to forward: logits come from running
         // a position, not from having run it earlier.
         let keep = common.min(want.len().saturating_sub(1));
-        sess.state.truncate(keep);
-        sess.history.truncate(keep);
-        keep
+        slots[idx].state.truncate(keep);
+        slots[idx].history.truncate(keep);
+        slots[idx].used = self.clock.fetch_add(1, Ordering::Relaxed);
+        (idx, keep)
     }
 
     fn generate(&self, prompt: &[u32], p: &Params, mut on_delta: impl FnMut(&str)) -> Result<Gen, String> {
-        let mut sess = self.session.lock().map_err(|_| "session poisoned")?;
+        let mut slots = self.session.lock().map_err(|_| "session poisoned")?;
         if prompt.is_empty() {
             return Err("empty prompt".into());
         }
-        if prompt.len() + p.plan.max_tokens > sess.state.ctx {
+        let ctx = slots[0].state.ctx;
+        if prompt.len() + p.plan.max_tokens > ctx {
             return Err(format!(
-                "prompt of {} tokens plus max_tokens {} exceeds the context window of {}",
+                "prompt of {} tokens plus max_tokens {} exceeds the context window of {ctx}",
                 prompt.len(),
                 p.plan.max_tokens,
-                sess.state.ctx
             ));
         }
 
-        let keep = self.rewind(&mut sess, prompt);
+        let (slot, keep) = self.claim(&mut slots, prompt);
+        let sess = &mut slots[slot];
         let mut logits = Vec::new();
         for chunk in prompt[keep..].chunks(64) {
             logits = self.model.forward(chunk, &mut sess.state);
@@ -423,7 +476,7 @@ impl Server {
             (Some(_), None) => return Err("response_format needs a tokenizer to constrain against".into()),
             (None, _) => None,
         };
-        let Session { state, history } = &mut *sess;
+        let Session { state, history, .. } = sess;
 
         // Stop sequences live out here rather than in the decode loop: they are
         // a property of the decoded text, not of the tokens, and returning false
@@ -622,7 +675,7 @@ impl Server {
         };
 
         let ctx = match self.session.lock() {
-            Ok(s) => s.state.ctx,
+            Ok(s) => s[0].state.ctx,
             Err(_) => return drop(conn.error(400, "session poisoned")),
         };
         let mut data = Vec::new();
@@ -745,7 +798,8 @@ impl Server {
                     drop(conn.json(200, &body.to_string()))
                 }
                 "/metrics" => {
-                    let body = self.metrics.render(self.queued.load(Ordering::SeqCst));
+                    let slots = self.session.lock().map(|s| s.len()).unwrap_or(0);
+                    let body = self.metrics.render(self.queued.load(Ordering::SeqCst), slots);
                     drop(conn.text(200, &body))
                 }
                 _ => drop(conn.error(404, "not found")),
