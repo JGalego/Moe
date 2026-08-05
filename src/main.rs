@@ -18,6 +18,7 @@ USAGE
   moe route <model|trace> [options]  analyse which experts the routing selected
   moe eval  <model> --text PATH      perplexity and bits/byte on held-out text
   moe embed <model> -p TEXT          pooled hidden state as a vector
+  moe chat  <model>                  talk to an instruct model in the terminal
 
 <model> is any of:
   ./model.moe                        a packed model file
@@ -66,6 +67,14 @@ SERVE OPTIONS
       --pin TRACE.jsonl     keep the experts that trace used resident
       --pool NAME           /v1/embeddings pooling: mean | last | first  [mean]
       --cors                allow browser origins
+
+CHAT OPTIONS
+      --system TEXT         a system message for the conversation
+      --ctx N               context window                [min(model, 4096)]
+      --chat-format NAME    chatml | llama3 | mistral     [the checkpoint's own]
+      --temp F, --top-p F, --top-k N, --seed N, --draft N   as for run
+      --stats               per-turn throughput and expert reuse
+  In the conversation: /reset clears it, /exit or Ctrl-D leaves.
 
 ROUTE OPTIONS
   Takes a model plus a prompt, or one or two *.jsonl traces from --trace.
@@ -222,6 +231,7 @@ fn main() {
         "route" => route_model(&args, &path),
         "eval" => eval(&args, &path),
         "embed" => embed(&args, &path),
+        "chat" => chat(&args, &path),
         other => fail(format!("unknown command '{other}' (try --help)")),
     }
 }
@@ -661,6 +671,147 @@ fn eval(args: &Args, path: &Path) {
                 String::new()
             },
         );
+    }
+}
+
+/// `moe chat <model>` — a conversation in the terminal.
+///
+/// The whole conversation is re-rendered through the chat template every turn,
+/// which sounds wasteful and is not: the new render extends the last one, so the
+/// KV cache already holds everything but the message just typed. That is the same
+/// prefix reuse the server does, and it is why a long conversation stays as quick
+/// as a short one.
+fn chat(args: &Args, path: &Path) {
+    let mut m = load(path);
+    m.prefetch = !args.on("no-prefetch");
+    let tok = tokenizer_for(args, path, Some(&m.store)).unwrap_or_else(|| fail("chat needs a tokenizer"));
+    let fmt = match args.get("chat-format") {
+        Some(name) => moe::serve::Prompting::Detected(
+            moe::ChatFormat::by_name(name)
+                .unwrap_or_else(|| fail(format!("unknown chat format '{name}' (chatml, llama3, mistral)"))),
+        ),
+        None => moe::serve::Prompting::resolve(m.store.chat_template.as_deref(), Some(&tok)).unwrap_or_else(|| {
+            fail("this checkpoint declares no chat template and none could be detected; pass --chat-format")
+        }),
+    };
+    let ctx: usize = args.get("ctx").and_then(|v| v.parse().ok()).unwrap_or_else(|| m.spec.max_ctx.min(4096));
+    let bos = m.spec.bos.map(|b| tok.decode_one(b)).unwrap_or_default();
+    let eos = m.spec.eos.first().map(|e| tok.decode_one(*e)).unwrap_or_default();
+    let plan = moe::Plan {
+        max_tokens: args.num("tokens", 512usize),
+        sampler: Sampler {
+            temp: args.num("temp", 0.7),
+            top_p: args.num("top-p", 0.95),
+            top_k: args.num("top-k", 0),
+            repeat_penalty: args.num("repeat-penalty", 1.0),
+            ..Sampler::default()
+        },
+        seed: args.num("seed", 0u64),
+        lookahead: args.num("draft", 0usize),
+        lookup: moe::Lookup::default(),
+        logprobs: 0,
+    };
+
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    if let Some(sys) = args.get("system") {
+        messages.push(serde_json::json!({"role": "system", "content": sys}));
+    }
+    let mut st = State::new(&m, ctx);
+    // The tokens the cache currently holds, so a turn only prefills what is new.
+    let mut cached: Vec<u32> = Vec::new();
+
+    eprintln!("moe chat — {} via {}. /reset clears, /exit leaves.\n", m.spec.arch, fmt.name());
+    let stdin = std::io::stdin();
+    loop {
+        eprint!("\x1b[36m›\x1b[0m ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        match stdin.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => fail(e),
+        }
+        let line = line.trim();
+        match line {
+            "" => continue,
+            "/exit" | "/quit" => break,
+            "/reset" => {
+                messages.retain(|msg| msg["role"] == "system");
+                st.reset();
+                cached.clear();
+                eprintln!("(cleared)");
+                continue;
+            }
+            _ => {}
+        }
+        messages.push(serde_json::json!({"role": "user", "content": line}));
+
+        let rendered = match fmt.render(&messages, &bos, &eos) {
+            Ok(t) => t,
+            Err(e) => fail(format!("chat template: {e}")),
+        };
+        let ids = tok.encode(&rendered, None);
+        if ids.len() + 8 >= ctx {
+            eprintln!("(the conversation no longer fits in {ctx} tokens; /reset to start again)");
+            messages.pop();
+            continue;
+        }
+        // Reuse whatever the cache already holds of this render.
+        let common = ids.iter().zip(&cached).take_while(|(a, b)| a == b).count();
+        let keep = common.min(ids.len().saturating_sub(1));
+        st.truncate(keep);
+        cached.truncate(keep);
+
+        let t0 = Instant::now();
+        let mut logits = Vec::new();
+        for chunk in ids[keep..].chunks(64) {
+            logits = m.forward(chunk, &mut st);
+            cached.extend_from_slice(chunk);
+        }
+        let prefill_s = t0.elapsed().as_secs_f32();
+
+        // Stop at the format's own turn marker as well as at EOS, since a
+        // checkpoint does not always make the two the same token.
+        let end = fmt.turn_end().unwrap_or("").to_string();
+        let mut reply = String::new();
+        let mut shown = 0usize;
+        let mut stream = Stream::default();
+        let t1 = Instant::now();
+        let gen = moe::generate::generate(&m, &mut st, &mut cached, logits, &plan, None, |next| {
+            reply.push_str(&stream.push(&tok, next));
+            if !end.is_empty() {
+                if let Some(at) = reply.find(&end) {
+                    reply.truncate(at);
+                    return false;
+                }
+            }
+            // Hold back only as much as a partial stop marker could need.
+            let safe = reply.len().saturating_sub(end.len().saturating_sub(1));
+            if safe > shown {
+                print!("{}", &reply[shown..safe]);
+                let _ = std::io::stdout().flush();
+                shown = safe;
+            }
+            true
+        });
+        if shown < reply.len() {
+            print!("{}", &reply[shown..]);
+        }
+        println!("\n");
+        let _ = std::io::stdout().flush();
+
+        if args.on("stats") {
+            let decode_s = t1.elapsed().as_secs_f32();
+            eprintln!(
+                "\x1b[2m{} prompt tokens ({} reused) in {prefill_s:.2}s | {} generated in {decode_s:.2}s ({:.1} tok/s) | expert reuse {:.0}%\x1b[0m",
+                ids.len(),
+                keep,
+                gen.tokens,
+                gen.tokens as f32 / decode_s.max(1e-6),
+                100.0 * st.stats.reuse_rate(),
+            );
+        }
+        messages.push(serde_json::json!({"role": "assistant", "content": reply}));
     }
 }
 

@@ -158,7 +158,7 @@ impl Prompting {
 
     /// The marker that closes an assistant turn, which is also where generation
     /// should stop whether or not the checkpoint made it an EOS token.
-    fn turn_end(&self) -> Option<&str> {
+    pub fn turn_end(&self) -> Option<&str> {
         match self {
             Prompting::Detected(f) => Some(f.assistant.1).filter(|e| !e.is_empty()),
             // A template's stop marker is the checkpoint's EOS, which the decode
@@ -167,7 +167,7 @@ impl Prompting {
         }
     }
 
-    fn render(&self, messages: &[Value], bos: &str, eos: &str) -> Result<String, String> {
+    pub fn render(&self, messages: &[Value], bos: &str, eos: &str) -> Result<String, String> {
         match self {
             Prompting::Template(t) => t.render(messages, true, bos, eos),
             Prompting::Detected(f) => f.render(messages),
