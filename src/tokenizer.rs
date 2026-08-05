@@ -175,6 +175,14 @@ impl Tokenizer {
         };
 
         let n = vocab.values().copied().max().unwrap_or(0) as usize + 1;
+        // An id is used as an index, so `n` becomes an allocation — and a file
+        // naming a huge id while listing few tokens would abort the process
+        // before anything could reject it. Real vocabularies are dense; allow
+        // generous slack for gaps and refuse the rest.
+        let bound = vocab.len().saturating_mul(4).saturating_add(1024);
+        if n > bound {
+            return Err(format!("tokenizer.json names token id {} but lists only {} tokens", n - 1, vocab.len()));
+        }
         let mut tokens = vec![String::new(); n];
         let mut special = vec![false; n];
         let mut literal = vec![false; n];
@@ -184,6 +192,13 @@ impl Tokenizer {
         let mut added = Vec::new();
         for a in j["added_tokens"].as_array().map(|a| a.iter()).into_iter().flatten() {
             let (Some(c), Some(id)) = (a["content"].as_str(), a["id"].as_u64()) else { continue };
+            // An added token with no content would match at every position while
+            // consuming nothing, so the scan in `encode` would never advance. A
+            // file declaring one is malformed; dropping it is the only reading
+            // that terminates.
+            if c.is_empty() {
+                continue;
+            }
             let id = id as u32;
             if (id as usize) < n {
                 tokens[id as usize] = c.to_string();
@@ -678,6 +693,33 @@ mod tests {
         let mut st = Stream::default();
         let streamed: String = t.encode("a", None).iter().map(|i| st.push(&t, *i)).collect();
         assert_eq!(streamed, "a");
+    }
+
+    /// A vocabulary id is used as a table index, so a file naming a huge one must
+    /// be refused rather than allocating a table that aborts the process.
+    #[test]
+    fn an_implausible_token_id_is_refused() {
+        let j = serde_json::json!({"model": {"vocab": {"a": 4_000_000_000u32}}});
+        let e = Tokenizer::from_json(&j).err().expect("should refuse a huge id");
+        assert!(e.contains("4000000000"), "{e}");
+        // Gaps are normal, though, so modest slack must still load.
+        let ok = serde_json::json!({"model": {"vocab": {"a": 0, "b": 500}}});
+        assert_eq!(Tokenizer::from_json(&ok).unwrap().vocab_size(), 501);
+    }
+
+    /// An added token with no content matches at every position and consumes
+    /// nothing, so encoding would never terminate. It has to be dropped.
+    #[test]
+    fn an_empty_added_token_cannot_stall_encoding() {
+        let j = serde_json::json!({
+            "model": {"vocab": {"a": 0, "b": 1}},
+            "added_tokens": [{"id": 1, "content": "", "special": true}],
+        });
+        let tok = Tokenizer::from_json(&j).unwrap();
+        // The point of the test is that this returns at all.
+        let ids = tok.encode("aaa", None);
+        assert!(!ids.is_empty());
+        assert!(tok.encode("", None).is_empty());
     }
 
     #[test]

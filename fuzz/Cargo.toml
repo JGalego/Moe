@@ -1,0 +1,57 @@
+# Fuzz targets for the parsers that read files the user did not write.
+#
+# These need a nightly toolchain and cargo-fuzz, so they are a separate crate and
+# are excluded from the workspace — `cargo test` at the root never builds them.
+# The same surfaces are swept deterministically by tests/malformed.rs, which is
+# what runs on every commit; this is for going deeper.
+#
+#     cargo install cargo-fuzz
+#     cargo +nightly fuzz run gguf
+#     cargo +nightly fuzz run tokenizer -- -max_total_time=300
+[package]
+name = "moe-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+[dependencies.moe]
+path = ".."
+package = "moe-ontap"
+default-features = false
+
+[[bin]]
+name = "gguf"
+path = "fuzz_targets/gguf.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "tokenizer"
+path = "fuzz_targets/tokenizer.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "grammar"
+path = "fuzz_targets/grammar.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "template"
+path = "fuzz_targets/template.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "store"
+path = "fuzz_targets/store.rs"
+test = false
+doc = false

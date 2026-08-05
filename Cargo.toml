@@ -16,6 +16,12 @@ readme = "README.md"
 keywords = ["llm", "inference", "mixture-of-experts", "moe", "cpu"]
 categories = ["command-line-utilities", "science"]
 
+# The fuzz targets need nightly and cargo-fuzz, so they stay out of the
+# workspace and `cargo test` never tries to build them.
+[workspace]
+members = []
+exclude = ["fuzz"]
+
 [[bin]]
 name = "moe"
 path = "src/main.rs"

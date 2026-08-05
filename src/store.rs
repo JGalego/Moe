@@ -33,8 +33,16 @@ struct Rec {
 }
 
 impl Rec {
+    /// Bytes the tensor occupies. Saturating, because these three numbers come
+    /// from a file header and a corrupt one must not wrap into a small answer
+    /// that then passes a bounds check.
     fn len(&self) -> usize {
-        self.slabs * self.rows * self.dt.row_bytes(self.cols)
+        self.slabs.saturating_mul(self.rows).saturating_mul(self.dt.row_bytes(self.cols))
+    }
+
+    /// Whether the tensor lies entirely inside a map of `n` bytes.
+    fn fits_in(&self, n: usize) -> bool {
+        self.off.checked_add(self.len()).is_some_and(|end| end <= n)
     }
 }
 
@@ -70,10 +78,12 @@ fn safetensors_index(buf: &[u8], map: usize) -> io::Result<(BTreeMap<String, Rec
         return err("truncated safetensors file");
     }
     let hlen = u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize;
-    let start = 8 + hlen;
-    if buf.len() < start {
-        return err("safetensors header longer than file");
-    }
+    // Checked, and checked *before* slicing: a length field is the one number a
+    // hostile file fully controls, and 8 + hlen can wrap.
+    let start = match hlen.checked_add(8) {
+        Some(s) if s <= buf.len() => s,
+        _ => return err(format!("safetensors header claims {hlen} bytes in a {}-byte file", buf.len())),
+    };
     let head: Value = serde_json::from_slice(&buf[8..start])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad header: {e}")))?;
     let mut out = BTreeMap::new();
@@ -92,8 +102,14 @@ fn safetensors_index(buf: &[u8], map: usize) -> io::Result<(BTreeMap<String, Rec
             3 => (shape[0], shape[1], shape[2]),
             _ => continue, // scalars and 4-D tensors have no role here
         };
-        let off = v["data_offsets"][0].as_u64().unwrap_or(0) as usize + start;
-        out.insert(name.clone(), Rec { map, off, dt, slabs, rows, cols });
+        let Some(off) = (v["data_offsets"][0].as_u64().unwrap_or(0) as usize).checked_add(start) else {
+            return err(format!("{name}: data offset overflows"));
+        };
+        let rec = Rec { map, off, dt, slabs, rows, cols };
+        if !rec.fits_in(buf.len()) {
+            return err(format!("{name}: {} bytes at offset {off} runs past the {}-byte file", rec.len(), buf.len()));
+        }
+        out.insert(name.clone(), rec);
     }
     Ok((out, start))
 }
@@ -195,9 +211,14 @@ impl Store {
             return err(format!("packed format v{ver}, this build speaks v{VERSION}"));
         }
         let hlen = u64::from_le_bytes(buf[8..16].try_into().unwrap()) as usize;
-        let head: Value = serde_json::from_slice(&buf[16..16 + hlen])
+        // Slicing on an unchecked header length is how a malformed file panics
+        // instead of erroring; this is the only bound that matters here.
+        let data = match hlen.checked_add(16) {
+            Some(end) if end <= buf.len() => end,
+            _ => return err(format!("{}: header claims {hlen} bytes in a {}-byte file", file.display(), buf.len())),
+        };
+        let head: Value = serde_json::from_slice(&buf[16..data])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad header: {e}")))?;
-        let data = 16 + hlen;
         let mut index = BTreeMap::new();
         for (name, v) in head["tensors"].as_object().map(|o| o.iter()).into_iter().flatten() {
             let dt = Dt::parse(v["dt"].as_str().unwrap_or("")).unwrap_or(Dt::F32);
@@ -210,8 +231,14 @@ impl Store {
                 2 => (1, dims[0], dims[1]),
                 _ => continue,
             };
-            let off = v["off"].as_u64().unwrap_or(0) as usize + data;
-            index.insert(name.clone(), Rec { map: 0, off, dt, slabs, rows, cols });
+            let Some(off) = (v["off"].as_u64().unwrap_or(0) as usize).checked_add(data) else {
+                return err(format!("{name}: offset overflows"));
+            };
+            let rec = Rec { map: 0, off, dt, slabs, rows, cols };
+            if !rec.fits_in(buf.len()) {
+                return err(format!("{name}: {} bytes at offset {off} runs past the file", rec.len()));
+            }
+            index.insert(name.clone(), rec);
         }
         Ok(Store {
             maps: vec![buf],
@@ -242,13 +269,15 @@ impl Store {
     /// fused `[experts, 2*inter, hidden]` stack, at zero copy.
     pub fn view(&self, name: &str, slab: usize, rows: std::ops::Range<usize>) -> Option<QT> {
         let r = self.index.get(name)?;
-        if rows.end > r.slabs * r.rows || rows.start >= rows.end {
+        if rows.end > r.slabs.checked_mul(r.rows)? || rows.start >= rows.end {
             return None;
         }
         let stride = r.dt.row_bytes(r.cols);
-        let base = r.off + (slab * r.rows + rows.start) * stride;
+        // Checked throughout: `slab` and the range come from the caller, and the
+        // offset from the file, so nothing here is known to be in range yet.
+        let base = r.off.checked_add(slab.checked_mul(r.rows)?.checked_add(rows.start)?.checked_mul(stride)?)?;
         let n = rows.end - rows.start;
-        let bytes = self.maps[r.map].get(base..base + n * stride)?;
+        let bytes = self.maps.get(r.map)?.get(base..base.checked_add(n.checked_mul(stride)?)?)?;
         Some(QT::new(r.dt, n, r.cols, bytes))
     }
 
