@@ -1,10 +1,10 @@
 # A conversation in the terminal, reusing the cache between turns.
 #   moe pull allenai/OLMoE-1B-7B-0924-Instruct
 #   vhs tapes/chat.tape
-Source common.tape
+Source tapes/common.tape
 Output assets/chat.gif
 Set Width 1240
-Set Height 460
+Set Height 400
 Set TypingSpeed 60ms
 
 Hide

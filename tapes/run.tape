@@ -1,7 +1,7 @@
 # Generation straight from a Hugging Face repo id.
 #   moe pull allenai/OLMoE-1B-7B-0924-Instruct   (once, before recording)
 #   vhs tapes/run.tape
-Source common.tape
+Source tapes/common.tape
 Output assets/run.gif
 Set Width 1240
 Set Height 210

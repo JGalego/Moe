@@ -1,10 +1,10 @@
 # Constrained decoding: the model cannot emit anything but this shape.
 #   moe pull allenai/OLMoE-1B-7B-0924-Instruct
 #   vhs tapes/json.tape
-Source common.tape
+Source tapes/common.tape
 Output assets/json.gif
 Set Width 1240
-Set Height 380
+Set Height 330
 
 Hide
 Type "PS1='$ ' && clear" Enter

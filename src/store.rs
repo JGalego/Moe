@@ -58,7 +58,11 @@ pub struct Store {
     /// reason the tokenizer is: a prompt format is part of the model.
     pub chat_template: Option<String>,
     pub path: PathBuf,
+    /// True for a single self-contained file — a `.moe` or a GGUF — which
+    /// carries its own config and tokenizer rather than files beside it.
     pub packed: bool,
+    /// True only for GGUF, which is packed but not *ours*.
+    pub gguf: bool,
 }
 
 fn err<T>(msg: impl Into<String>) -> io::Result<T> {
@@ -164,6 +168,7 @@ impl Store {
             chat_template: g.chat_template(),
             path: file.into(),
             packed: true,
+            gguf: true,
         })
     }
 
@@ -199,6 +204,7 @@ impl Store {
             chat_template: chat_template_in(dir),
             path: dir.into(),
             packed: false,
+            gguf: false,
         })
     }
 
@@ -251,7 +257,17 @@ impl Store {
             chat_template: head["chat_template"].as_str().map(String::from),
             path: file.into(),
             packed: true,
+            gguf: false,
         })
+    }
+
+    /// What this store was read from, for `moe info`.
+    pub fn kind(&self) -> &'static str {
+        match (self.packed, self.gguf) {
+            (_, true) => "gguf",
+            (true, _) => "packed",
+            _ => "safetensors",
+        }
     }
 
     /// Whole tensor, with any leading expert dimension flattened into rows.

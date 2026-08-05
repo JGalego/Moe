@@ -3,3 +3,9 @@
 *.moe
 __pycache__/
 *.pyc
+
+# byproducts of the demo tapes in tapes/
+/ask.json
+/list.json
+/person.json
+/code.jsonl

@@ -214,6 +214,10 @@ fn a_gguf_can_be_packed() {
 
     let m = Model::load(Store::open(&out).unwrap()).expect("load the packed model");
     assert_eq!(m.spec.experts, 4);
+    // The two are both single self-contained files, but `moe info` must not call
+    // a GGUF one of ours.
+    assert_eq!(Store::open(&path).unwrap().kind(), "gguf");
+    assert_eq!(m.store.kind(), "packed");
     let mut st = State::new(&m, 32);
     let got = m.forward(&tokens, &mut st);
     let last = want.last().unwrap();

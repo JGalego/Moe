@@ -1,10 +1,10 @@
 # Trace a domain, then keep only the experts it reaches.
 #   moe pull allenai/OLMoE-1B-7B-0924-Instruct
 #   vhs tapes/prune.tape
-Source common.tape
+Source tapes/common.tape
 Output assets/prune.gif
 Set Width 1240
-Set Height 440
+Set Height 540
 
 Hide
 Type "PS1='$ ' && clear" Enter
@@ -12,7 +12,7 @@ Type "CODE='def merge(a, b): return {**a, **b}  # dict union, py3.5+'" Enter
 Type "clear" Enter
 Show
 
-Type "moe run allenai/OLMoE-1B-7B-0924-Instruct -p \"$CODE\" -n 48 --trace code.jsonl --no-stream"
+Type 'moe run allenai/OLMoE-1B-7B-0924-Instruct -p "$CODE" -n 48 --trace code.jsonl --no-stream'
 Sleep 700ms
 Enter
 Sleep 20s

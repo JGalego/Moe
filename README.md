@@ -221,8 +221,9 @@ more than for one, and the engine already has one code path for `t` tokens. So
 keeps whatever prefix the model agrees with.
 
 ```console
-$ moe run <model> -p "..." -n 128 --draft 8
-draft 96 of 120 accepted (80%) | 1.71 tokens per forward step
+$ moe run <model> -p "Repeat this list back exactly: alpha, beta, ..." -n 32 --draft 8
+decode 32 tok in 2.69s (11.89 tok/s)          # 6.89 tok/s without --draft
+draft 21 of 24 accepted (88%) | 2.91 tokens per forward step
 ```
 
 ![speculative decoding](assets/draft.gif)
@@ -271,15 +272,19 @@ is masked to probability zero, so it is rejected like any other bad guess.
 `moe route` reports which experts a prompt selected, and how evenly:
 
 ```console
-$ moe route <model> -p "def parse(xs): ..." --top 3
-OlmoeForCausalLM: 42 tokens, 16 routed layers, 64 experts, top-8
-coverage 61% of (layer, expert) pairs touched   mean entropy 0.83   mean peak/uniform 3.1x
+$ moe route allenai/OLMoE-1B-7B-0924-Instruct --top 3 \
+    -p "def parse(xs): return [int(x) for x in xs.split()]"
+OlmoeForCausalLM: 19 tokens, 16 routed layers, 64 experts, top-8
+coverage 49% of (layer, expert) pairs touched   mean entropy 0.72   mean peak/uniform 7.7x
 
   layer  entropy  peak  dead  busiest experts
-  L0        0.86   2.4x     9  e17:71%  e3:64%  e41:52%
-  L1        0.81   3.6x    14  e52:88%  e9:57%  e22:45%
+  L0        0.82   7.2x    22  e6:89%  e21:89%  e0:53%
+  L1        0.86   6.7x    13  e18:84%  e15:74%  e25:58%
+  L2        0.80   8.0x    24  e40:100%  e60:79%  e45:53%
   ...
 ```
+
+![moe route](assets/route.gif)
 
 Three numbers worth having. **Entropy**, normalised, says whether the router is
 using its capacity: 1.0 is a perfectly even spread, 0.0 is every token choosing
@@ -330,7 +335,8 @@ code questions.
 ```console
 $ moe run <model> -p "$(cat code-corpus.txt)" -n 256 --trace code.jsonl
 $ moe pack <model> --quant q8 --expert-quant q4 --keep-experts code.jsonl --keep 16
-pruning 64 experts per layer to 16 (from 312 tokens of trace; 61% of pairs were used)
+pruning 64 experts per layer to 16 (from 72 tokens of trace; 71% of pairs were used)
+done in 17.1s: 12.89 GB -> 1.32 GB (9.79x)
 ```
 
 ![pruning](assets/prune.gif)
@@ -351,13 +357,16 @@ A compression ratio says nothing about whether a model still works. `moe eval`
 scores held-out text, and `--vs` scores a second model on the same tokens:
 
 ```console
-$ moe eval <model> --text wiki.txt --vs model-q4.moe
-scoring 48213 tokens, window 2048, stride 1024
+$ moe eval allenai/OLMoE-1B-7B-0924-Instruct --text tests/fixtures/austen.txt \
+    --ctx 512 --limit 512 --vs olmoe-q4.moe
+scoring 512 tokens, window 512, stride 256
 
-OLMoE-1B-7B-0924             ppl   11.204   nll 2.4162   bits/token 3.486   bits/byte 0.812
-olmoe-q4.moe                 ppl   11.559   nll 2.4474   bits/token 3.531   bits/byte 0.822
+allenai/OLMoE-1B-7B-0924-Instruct ppl    4.342   nll 1.4682   bits/token 2.118   bits/byte 0.561
+                             511 tokens in 19.4s (26.3 tok/s)
+olmoe-q4.moe                 ppl    4.718   nll 1.5514   bits/token 2.238   bits/byte 0.593
+                             511 tokens in 23.7s (21.6 tok/s)
 
-delta                        ppl +0.355 (+3.17%)   nll +0.0312   bits/byte +0.0104
+delta                        ppl +0.376 (+8.67%)   nll +0.0831   bits/byte +0.0318
 ```
 
 ![moe eval](assets/eval.gif)
@@ -375,8 +384,9 @@ The hidden states were there all along; pooling them instead of unembedding make
 the same checkpoint usable for retrieval.
 
 ```console
-$ moe embed <model> -p "a cat sat on the mat" --vs "the kitten rested on the rug"
-cosine 0.8734   dim 2048   pooling Last
+$ moe embed <model> --pool last -p "a cat sat on the mat" \
+    --vs "the kitten rested on the rug"
+cosine 0.6738   dim 2048   pooling Last
 
 $ moe embed <model> --prompts corpus.txt -o vectors.jsonl
 $ curl localhost:8080/v1/embeddings -d '{"input": ["a", "b"]}'

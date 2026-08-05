@@ -275,7 +275,7 @@ fn info(path: &Path) {
     println!("  formats  {}", dt.join(", "));
     let (kd, vd) = m.kv_dims();
     println!("kv cache   {} per 1k tokens", human((m.spec.layers * (kd + vd) * 4 * 1024) as u64));
-    println!("source     {} ({})", m.store.path.display(), if m.store.packed { "packed" } else { "safetensors" });
+    println!("source     {} ({})", m.store.path.display(), m.store.kind());
 }
 
 fn pack(args: &Args, path: &Path, spec: &str) {
