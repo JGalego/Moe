@@ -427,6 +427,79 @@ fn pruning_past_the_used_set_still_yields_a_valid_model() {
     let _ = std::fs::remove_file(&out);
 }
 
+/// Mixed precision must put the finer format on exactly the named experts and
+/// leave everything else at the blanket rate — and the result must still load and
+/// predict what the coarse-everywhere model roughly predicts.
+#[test]
+fn hot_experts_get_the_finer_format() {
+    let f = fixture("gqa");
+    let full = load(&f.dir);
+    let (layers, top_k) = (full.spec.layers, full.spec.top_k);
+
+    let mut st = State::new(&full, 32);
+    st.trace();
+    full.forward(&f.tokens, &mut st);
+    let counts = moe::Counts::from_trace(st.trace.as_ref().unwrap(), "m", full.spec.experts, top_k);
+    // One hot expert per layer.
+    let experts: Vec<(u32, u32)> =
+        (0..layers as u32).flat_map(|l| counts.top(l, 1).into_iter().map(move |(e, _)| (l, e))).collect();
+    assert_eq!(experts.len(), layers);
+    let hot = moe::Hot { experts: experts.clone(), dt: Dt::Q8 };
+
+    let bytes_at = |path: &Path, dt: Dt| -> u64 {
+        load(path).dtypes().into_iter().find(|(d, _)| *d == dt).map(|(_, b)| b).unwrap_or(0)
+    };
+    let uniform = std::env::temp_dir().join("moe-test-uniform.moe");
+    let mixed = std::env::temp_dir().join("moe-test-mixed.moe");
+    let src = Store::open(&f.dir).unwrap();
+    src.pack_with(&uniform, Dt::Q8, Dt::Q4, None, None, |_| {}).unwrap();
+    src.pack_with(&mixed, Dt::Q8, Dt::Q4, None, Some(&hot), |_| {}).unwrap();
+
+    // The hot experts moved from Q4 to Q8, so one bucket grows and the other
+    // shrinks by the same experts' worth.
+    assert!(bytes_at(&mixed, Dt::Q4) < bytes_at(&uniform, Dt::Q4), "no expert left Q4");
+    assert!(bytes_at(&mixed, Dt::Q8) > bytes_at(&uniform, Dt::Q8), "no expert reached Q8");
+    // And Q4 is still in use, so this is genuinely mixed rather than all-Q8.
+    assert!(bytes_at(&mixed, Dt::Q4) > 0, "every expert was promoted");
+
+    // It still loads and predicts, with error bounded by the coarser format.
+    let m = load(&mixed);
+    assert_eq!(m.spec.experts, full.spec.experts, "mixed precision changed the expert count");
+    let mut st2 = State::new(&m, 32);
+    let got = m.forward(&f.tokens, &mut st2);
+    let want = f.logits.last().unwrap();
+    assert_eq!(argmax(&got), argmax(want), "mixed precision moved the prediction");
+
+    // Naming no experts is the same file as no hot set at all.
+    let none = std::env::temp_dir().join("moe-test-nohot.moe");
+    src.pack_with(&none, Dt::Q8, Dt::Q4, None, Some(&moe::Hot { experts: Vec::new(), dt: Dt::Q8 }), |_| {}).unwrap();
+    assert_eq!(bytes_at(&none, Dt::Q4), bytes_at(&uniform, Dt::Q4));
+
+    for p in [uniform, mixed, none] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Every block format must survive a real forward pass, not only a round trip.
+#[test]
+fn every_block_format_packs_a_working_model() {
+    for (dt, tol) in [(Dt::Q8, 0.25), (Dt::Q6, 0.4), (Dt::Q5, 0.7), (Dt::Q4, 1.5)] {
+        for name in ["gqa", "mla"] {
+            let f = fixture(name);
+            let out = std::env::temp_dir().join(format!("moe-fmt-{name}-{}.moe", dt.name()));
+            Store::open(&f.dir).unwrap().pack(&out, dt, dt, |_| {}).unwrap();
+            let m = load(&out);
+            let mut st = State::new(&m, 32);
+            let got = m.forward(&f.tokens, &mut st);
+            let want = f.logits.last().unwrap();
+            let d = max_abs_diff(&got, want);
+            assert!(d < tol, "{name} at {}: max |diff| = {d} (tol {tol})", dt.name());
+            assert!(got.iter().all(|v| v.is_finite()), "{name} at {} produced non-finite logits", dt.name());
+            let _ = std::fs::remove_file(&out);
+        }
+    }
+}
+
 #[test]
 fn forward_all_matches_reference_at_every_position() {
     check_forward_all("gqa");

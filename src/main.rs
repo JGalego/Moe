@@ -108,10 +108,14 @@ EMBED OPTIONS
 
 PACK OPTIONS
   -o, --out PATH            output file                   [./<name>.moe]
-      --quant FMT           dense weights: q4 q8 f16 f32  [q8]
+      --quant FMT           dense weights                 [q8]
       --expert-quant FMT    routed experts                [--quant]
+      --quant FMT/--expert-quant FMT take q4 q5 q6 q8 f16 f32
       --keep-experts TRACE  prune to the experts this trace used, per layer
       --keep N              how many to keep per layer    [top_k x 2]
+      --hot-experts TRACE    store the experts this trace leans on more finely
+      --hot-quant FMT        the format they get                       [q8]
+      --hot N                how many per layer count as hot           [top_k]
 
 GLOBAL
       --threads N           worker threads                [all cores]
@@ -307,9 +311,30 @@ fn pack(args: &Args, path: &Path, spec: &str) {
         );
         plan
     });
+    // Per-expert precision, from the same kind of trace pruning uses. Routing is
+    // skewed, so the experts a workload leans on are worth more bits than the
+    // ones it barely touches.
+    let hot = args.get("hot-experts").map(|trace| {
+        let counts = moe::Counts::read(Path::new(trace)).unwrap_or_else(|e| fail(format!("{trace}: {e}")));
+        if counts.is_empty() {
+            fail(format!("{trace}: no routing records"));
+        }
+        let derived = moe::Spec::derive(&store).unwrap_or_else(|e| fail(e));
+        if derived.experts == 0 {
+            fail("this checkpoint is dense: there are no experts to vary");
+        }
+        let n = args.num("hot", derived.top_k.max(1));
+        let experts: Vec<(u32, u32)> =
+            (0..derived.layers as u32).flat_map(|l| counts.top(l, n).into_iter().map(move |(e, _)| (l, e))).collect();
+        let hot_dt = dt("hot-quant", Dt::Q8);
+        println!("storing {} hot experts as {} and the rest as {}", experts.len(), hot_dt.name(), expert.name());
+        moe::Hot { experts, dt: hot_dt }
+    });
     println!("packing {} -> {} (dense {}, experts {})", path.display(), out.display(), weight.name(), expert.name());
     let t0 = Instant::now();
-    store.pack_pruned(&out, weight, expert, prune.as_ref(), |line| println!("{line}")).unwrap_or_else(|e| fail(e));
+    store
+        .pack_with(&out, weight, expert, prune.as_ref(), hot.as_ref(), |line| println!("{line}"))
+        .unwrap_or_else(|e| fail(e));
     let after = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     println!(
         "done in {:.1}s: {} -> {} ({:.2}x)",

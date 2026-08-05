@@ -277,6 +277,24 @@ impl Store {
         weight_dt: Dt,
         expert_dt: Dt,
         prune: Option<&Prune>,
+        log: impl FnMut(&str),
+    ) -> io::Result<()> {
+        self.pack_with(out, weight_dt, expert_dt, prune, None, log)
+    }
+
+    /// The full form, with per-expert precision as well as pruning.
+    ///
+    /// `hot` names experts that get a finer format than the rest. Routing is
+    /// skewed, so most of a checkpoint's bytes belong to experts a workload
+    /// rarely selects — those can be cheap, while the handful it leans on stay
+    /// accurate. That is a better trade than one rate for all of them.
+    pub fn pack_with(
+        &self,
+        out: &Path,
+        weight_dt: Dt,
+        expert_dt: Dt,
+        prune: Option<&Prune>,
+        hot: Option<&Hot>,
         mut log: impl FnMut(&str),
     ) -> io::Result<()> {
         let mut tensors = serde_json::Map::new();
@@ -296,7 +314,8 @@ impl Store {
             let target = if r.rows == 1 || !is_big_weight(name) {
                 Dt::F32
             } else if is_expert(name) {
-                expert_dt
+                // A hot expert overrides the blanket expert format.
+                hot.and_then(|h| h.format_for(name)).unwrap_or(expert_dt)
             } else {
                 weight_dt
             };
@@ -401,6 +420,37 @@ struct Item {
 enum Selection {
     Drop,
     Keep { name: String, rows: Option<Vec<usize>>, cols: Option<Vec<usize>>, slabs: Option<usize> },
+}
+
+/// Experts worth spending more bits on, and how many.
+///
+/// Built from a trace: the experts a workload actually leans on. Applies only to
+/// checkpoints that store experts as separate tensors — a fused
+/// `[experts, rows, cols]` stack is one tensor with one format, so there is
+/// nothing per-expert to vary, and it silently keeps the blanket rate.
+#[derive(Clone, Debug)]
+pub struct Hot {
+    /// `(layer, expert)` pairs to store at `dt`.
+    pub experts: Vec<(u32, u32)>,
+    pub dt: Dt,
+}
+
+impl Hot {
+    fn format_for(&self, name: &str) -> Option<Dt> {
+        let (layer, at) = Prune::layer_of(name)?;
+        let suffix = &name[at..];
+        for marker in ["mlp.experts.", "block_sparse_moe.experts."] {
+            if let Some(rest) = suffix.strip_prefix(marker) {
+                let num = rest.split('.').next()?;
+                let e: u32 = num.parse().ok()?;
+                if self.experts.contains(&(layer as u32, e)) {
+                    return Some(self.dt);
+                }
+                return None;
+            }
+        }
+        None
+    }
 }
 
 /// Which experts each layer keeps.

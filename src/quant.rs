@@ -21,6 +21,10 @@ pub enum Dt {
     Q8,
     /// 4-bit symmetric, f16 scale per 32 values (4.5 bits/weight).
     Q4,
+    /// 6-bit symmetric, f16 scale per 32 values (6.5 bits/weight).
+    Q6,
+    /// 5-bit symmetric, f16 scale per 32 values (5.5 bits/weight).
+    Q5,
 }
 
 impl Dt {
@@ -31,6 +35,8 @@ impl Dt {
             "BF16" | "bf16" => Dt::BF16,
             "Q8" | "q8" => Dt::Q8,
             "Q4" | "q4" => Dt::Q4,
+            "Q5" | "q5" => Dt::Q5,
+            "Q6" | "q6" => Dt::Q6,
             _ => return None,
         })
     }
@@ -42,6 +48,8 @@ impl Dt {
             Dt::BF16 => "BF16",
             Dt::Q8 => "Q8",
             Dt::Q4 => "Q4",
+            Dt::Q5 => "Q5",
+            Dt::Q6 => "Q6",
         }
     }
 
@@ -52,13 +60,17 @@ impl Dt {
             Dt::F16 | Dt::BF16 => cols * 2,
             Dt::Q8 => cols / BLK * (2 + BLK),
             Dt::Q4 => cols / BLK * (2 + BLK / 2),
+            // A nibble each, plus one spare bit per value packed 8 to a byte.
+            Dt::Q5 => cols / BLK * (2 + BLK / 2 + BLK / 8),
+            // A nibble each, plus two spare bits per value packed 4 to a byte.
+            Dt::Q6 => cols / BLK * (2 + BLK / 2 + BLK / 4),
         }
     }
 
     /// Whether a row of `cols` elements can be stored in this format.
     pub fn fits(self, cols: usize) -> bool {
         match self {
-            Dt::Q8 | Dt::Q4 => cols % BLK == 0,
+            Dt::Q8 | Dt::Q4 | Dt::Q5 | Dt::Q6 => cols % BLK == 0,
             _ => true,
         }
     }
@@ -181,6 +193,34 @@ pub fn dequant(dt: Dt, src: &[u8], out: &mut [f32]) {
                 }
             }
         }
+        // Q5 and Q6 keep Q4's nibble pairing — value `i` in the low half of byte
+        // `i`, value `i + 16` in the high half — and add the remaining bits in a
+        // trailing plane. Sharing the layout means the same indexing reasoning
+        // holds for all three.
+        Dt::Q5 => {
+            for (blk, o) in src.chunks_exact(2 + BLK / 2 + BLK / 8).zip(out.chunks_mut(BLK)) {
+                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                let hi = &blk[2 + BLK / 2..];
+                let bit = |j: usize| ((hi[j / 8] >> (j % 8)) & 1) as i32;
+                for i in 0..BLK / 2 {
+                    let b = blk[2 + i];
+                    o[i] = d * (((b & 0x0f) as i32 | (bit(i) << 4)) - 16) as f32;
+                    o[i + BLK / 2] = d * (((b >> 4) as i32 | (bit(i + BLK / 2) << 4)) - 16) as f32;
+                }
+            }
+        }
+        Dt::Q6 => {
+            for (blk, o) in src.chunks_exact(2 + BLK / 2 + BLK / 4).zip(out.chunks_mut(BLK)) {
+                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                let hi = &blk[2 + BLK / 2..];
+                let pair = |j: usize| ((hi[j / 4] >> ((j % 4) * 2)) & 0x3) as i32;
+                for i in 0..BLK / 2 {
+                    let b = blk[2 + i];
+                    o[i] = d * (((b & 0x0f) as i32 | (pair(i) << 4)) - 32) as f32;
+                    o[i + BLK / 2] = d * (((b >> 4) as i32 | (pair(i + BLK / 2) << 4)) - 32) as f32;
+                }
+            }
+        }
     }
 }
 
@@ -225,6 +265,41 @@ pub fn quantize(dt: Dt, src: &[f32], dst: &mut [u8]) {
                 let q = |v: f32| ((v * inv).round() as i32 + 8).clamp(0, 15) as u8;
                 for i in 0..BLK / 2 {
                     blk[2 + i] = q(s[i]) | (q(s[i + BLK / 2]) << 4);
+                }
+            }
+        }
+        Dt::Q5 => {
+            for (s, blk) in src.chunks_exact(BLK).zip(dst.chunks_exact_mut(2 + BLK / 2 + BLK / 8)) {
+                let amax = s.iter().fold(0f32, |m, v| m.max(v.abs()));
+                // 15 levels either side of zero, so the offset is 16.
+                let d = amax / 15.0;
+                blk[..2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+                let inv = if d > 0.0 { 1.0 / f16_to_f32(f32_to_f16(d)) } else { 0.0 };
+                let q = |v: f32| ((v * inv).round() as i32 + 16).clamp(0, 31) as u8;
+                blk[2..].iter_mut().for_each(|b| *b = 0);
+                for i in 0..BLK / 2 {
+                    let (lo, hi) = (q(s[i]), q(s[i + BLK / 2]));
+                    blk[2 + i] = (lo & 0x0f) | ((hi & 0x0f) << 4);
+                    for (j, v) in [(i, lo), (i + BLK / 2, hi)] {
+                        blk[2 + BLK / 2 + j / 8] |= ((v >> 4) & 1) << (j % 8);
+                    }
+                }
+            }
+        }
+        Dt::Q6 => {
+            for (s, blk) in src.chunks_exact(BLK).zip(dst.chunks_exact_mut(2 + BLK / 2 + BLK / 4)) {
+                let amax = s.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let d = amax / 31.0;
+                blk[..2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+                let inv = if d > 0.0 { 1.0 / f16_to_f32(f32_to_f16(d)) } else { 0.0 };
+                let q = |v: f32| ((v * inv).round() as i32 + 32).clamp(0, 63) as u8;
+                blk[2..].iter_mut().for_each(|b| *b = 0);
+                for i in 0..BLK / 2 {
+                    let (lo, hi) = (q(s[i]), q(s[i + BLK / 2]));
+                    blk[2 + i] = (lo & 0x0f) | ((hi & 0x0f) << 4);
+                    for (j, v) in [(i, lo), (i + BLK / 2, hi)] {
+                        blk[2 + BLK / 2 + j / 4] |= ((v >> 4) & 0x3) << ((j % 4) * 2);
+                    }
                 }
             }
         }
@@ -377,7 +452,15 @@ mod tests {
     #[test]
     fn quant_roundtrip_within_tolerance() {
         let row: Vec<f32> = (0..128).map(|i| ((i * 37 % 71) as f32 - 35.0) / 10.0).collect();
-        for (dt, tol) in [(Dt::F32, 1e-6), (Dt::F16, 1e-2), (Dt::BF16, 5e-2), (Dt::Q8, 3e-2), (Dt::Q4, 0.4)] {
+        for (dt, tol) in [
+            (Dt::F32, 1e-6),
+            (Dt::F16, 1e-2),
+            (Dt::BF16, 5e-2),
+            (Dt::Q8, 3e-2),
+            (Dt::Q6, 6e-2),
+            (Dt::Q5, 0.12),
+            (Dt::Q4, 0.4),
+        ] {
             let mut packed = vec![0u8; dt.row_bytes(row.len())];
             quantize(dt, &row, &mut packed);
             let mut back = vec![0.0; row.len()];
@@ -386,6 +469,63 @@ mod tests {
                 assert!((a - b).abs() < tol, "{:?}: {a} vs {b}", dt);
             }
         }
+    }
+
+    /// The block formats must sit in the right order on both axes: more bits
+    /// means more bytes and less error. A layout bug in the spare-bit planes
+    /// would show up here as Q5 or Q6 being no better than Q4.
+    #[test]
+    fn more_bits_costs_more_space_and_loses_less() {
+        // A smooth ramp with an outlier, so the per-block scale is exercised.
+        let row: Vec<f32> = (0..256).map(|i| (i as f32 / 255.0 - 0.5) * if i == 3 { 9.0 } else { 2.0 }).collect();
+        let mut prev: Option<(Dt, usize, f32)> = None;
+        for dt in [Dt::Q4, Dt::Q5, Dt::Q6, Dt::Q8] {
+            let bytes = dt.row_bytes(row.len());
+            let mut packed = vec![0u8; bytes];
+            quantize(dt, &row, &mut packed);
+            let mut back = vec![0.0; row.len()];
+            dequant(dt, &packed, &mut back);
+            let err = row.iter().zip(&back).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+            if let Some((pdt, pbytes, perr)) = prev {
+                assert!(bytes > pbytes, "{dt:?} is not larger than {pdt:?}: {bytes} vs {pbytes}");
+                assert!(err < perr, "{dt:?} is not more accurate than {pdt:?}: {err} vs {perr}");
+            }
+            prev = Some((dt, bytes, err));
+        }
+        // The advertised widths, to the byte: 4.5, 5.5, 6.5 and 8.5 bits.
+        for (dt, bits) in [(Dt::Q4, 4.5), (Dt::Q5, 5.5), (Dt::Q6, 6.5), (Dt::Q8, 8.5)] {
+            let got = dt.row_bytes(BLK) as f32 * 8.0 / BLK as f32;
+            assert!((got - bits).abs() < 1e-6, "{dt:?} costs {got} bits per weight, not {bits}");
+        }
+    }
+
+    /// Every representable level must survive a round trip, or the high-bit
+    /// plane is being packed or read at the wrong offset.
+    #[test]
+    fn every_level_round_trips() {
+        for (dt, levels) in [(Dt::Q4, 15i32), (Dt::Q5, 31), (Dt::Q6, 63), (Dt::Q8, 255)] {
+            let half = levels / 2;
+            // Exactly the grid the format quantises to, scaled by 1.
+            let row: Vec<f32> = (0..BLK).map(|i| (i as i32 % (half + 1) - half / 2) as f32).collect();
+            let mut packed = vec![0u8; dt.row_bytes(row.len())];
+            quantize(dt, &row, &mut packed);
+            let mut back = vec![0.0; row.len()];
+            dequant(dt, &packed, &mut back);
+            let amax = row.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let step = amax / (half as f32).max(1.0);
+            for (i, (a, b)) in row.iter().zip(&back).enumerate() {
+                assert!((a - b).abs() <= step * 0.75, "{dt:?} position {i}: {a} came back as {b} (step {step})");
+            }
+        }
+    }
+
+    #[test]
+    fn names_round_trip_through_parse() {
+        for dt in [Dt::F32, Dt::F16, Dt::BF16, Dt::Q8, Dt::Q6, Dt::Q5, Dt::Q4] {
+            assert_eq!(Dt::parse(dt.name()), Some(dt));
+            assert_eq!(Dt::parse(&dt.name().to_lowercase()), Some(dt));
+        }
+        assert_eq!(Dt::parse("q3"), None);
     }
 
     #[test]
