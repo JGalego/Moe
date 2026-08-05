@@ -131,6 +131,54 @@ fn metadata_endpoints_answer() {
     assert!(get(port, "/nope").contains("not found"));
 }
 
+/// Embeddings over HTTP must agree with the engine, batch in the order they were
+/// given, and stay stateless — the generation session's cache must be untouched
+/// afterwards, since embedding shares nothing with it.
+#[test]
+fn embeddings_match_the_engine_and_batch_in_order() {
+    let port = boot(true);
+    let m = model();
+    let (a, b) = (vec![1u32, 2, 3], vec![7u32, 8]);
+
+    let raw = post(port, "/v1/embeddings", &serde_json::json!({"input": [a, b]}).to_string());
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{e}: {raw}"));
+    assert_eq!(v["object"], "list");
+    assert_eq!(v["data"].as_array().unwrap().len(), 2);
+    assert_eq!(v["usage"]["prompt_tokens"], 5, "token count is the sum of the inputs");
+
+    for (i, ids) in [&a, &b].iter().enumerate() {
+        assert_eq!(v["data"][i]["index"], i, "batch came back out of order");
+        let got: Vec<f32> =
+            v["data"][i]["embedding"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
+        let want = m.embed(ids, 64, moe::Pool::Mean, true);
+        assert_eq!(got.len(), want.len());
+        let d = got.iter().zip(&want).fold(0.0f32, |mx, (x, y)| mx.max((x - y).abs()));
+        assert!(d < 1e-5, "input {i}: HTTP embedding differs from the engine by {d}");
+        // The endpoint always normalises.
+        let norm = got.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-4, "input {i}: length {norm}");
+    }
+
+    // A single input, not a list, is also accepted.
+    let one = post(port, "/v1/embeddings", &serde_json::json!({"input": a}).to_string());
+    let one: serde_json::Value = serde_json::from_str(&one).unwrap();
+    assert_eq!(one["data"].as_array().unwrap().len(), 1);
+
+    // Bad shapes are refused rather than half-answered.
+    for bad in [
+        serde_json::json!({}),
+        serde_json::json!({"input": []}),
+        serde_json::json!({"input": 5}),
+        serde_json::json!({"input": [[]]}),
+    ] {
+        let r = post(port, "/v1/embeddings", &bad.to_string());
+        assert!(r.contains("error"), "{bad} was not refused: {r}");
+    }
+
+    // Generation still works afterwards, so embedding disturbed no state.
+    assert!(!completion(port, &[1, 2, 3], 4).is_empty());
+}
+
 #[test]
 fn bad_requests_are_refused_not_crashed() {
     let port = boot(true);

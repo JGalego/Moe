@@ -17,6 +17,7 @@ USAGE
   moe serve <model> [options]        OpenAI-compatible HTTP server
   moe route <model|trace> [options]  analyse which experts the routing selected
   moe eval  <model> --text PATH      perplexity and bits/byte on held-out text
+  moe embed <model> -p TEXT          pooled hidden state as a vector
 
 <model> is any of:
   ./model.moe                        a packed model file
@@ -61,6 +62,7 @@ SERVE OPTIONS
       --draft N             speculate N tokens per step, 0 = off       [0]
       --no-prefetch         stop advising the kernel about the next step's experts
       --pin TRACE.jsonl     keep the experts that trace used resident
+      --pool NAME           /v1/embeddings pooling: mean | last | first  [mean]
       --cors                allow browser origins
 
 ROUTE OPTIONS
@@ -80,6 +82,14 @@ EVAL OPTIONS
       --stride N            window step; smaller is slower and more accurate
                                                           [--ctx / 2]
       --limit N             stop after N tokens           [all]
+
+EMBED OPTIONS
+  -p, --prompt TEXT         text to embed
+      --prompts PATH        one text per line; writes one JSON vector per line
+      --vs TEXT             embed a second text and print the cosine similarity
+      --pool NAME           mean | last | first                    [mean]
+      --no-normalize        leave the vector un-normalised
+  -o, --out PATH            write vectors here instead of stdout
 
 PACK OPTIONS
   -o, --out PATH            output file                   [./<name>.moe]
@@ -131,6 +141,7 @@ impl Args {
                         | "no-prefix-cache"
                         | "json"
                         | "no-prefetch"
+                        | "no-normalize"
                 );
                 let val = match inline {
                     Some(v) => v,
@@ -208,6 +219,7 @@ fn main() {
         "serve" => serve(&args, &path, &spec),
         "route" => route_model(&args, &path),
         "eval" => eval(&args, &path),
+        "embed" => embed(&args, &path),
         other => fail(format!("unknown command '{other}' (try --help)")),
     }
 }
@@ -499,6 +511,9 @@ fn serve(args: &Args, path: &Path, spec: &str) {
     server.cors = args.on("cors");
     server.max_queue = args.num("max-queue", 32usize).max(1);
     server.lookahead = args.num("draft", 0usize);
+    if let Some(p) = args.get("pool") {
+        server.pool = moe::Pool::parse(p).unwrap_or_else(|| fail(format!("unknown pooling '{p}' (mean, last, first)")));
+    }
     let host = args.get("host").unwrap_or("127.0.0.1").to_string();
     let port = args.num("port", 8080u16);
     moe::serve::run(server, &host, port).unwrap_or_else(|e| fail(format!("{host}:{port}: {e}")));
@@ -643,6 +658,70 @@ fn eval(args: &Args, path: &Path) {
             },
         );
     }
+}
+
+/// `moe embed <model> -p TEXT` — the pooled hidden state as a vector.
+///
+/// With `--vs` it prints the cosine similarity of two texts instead, which is
+/// the only way to tell at a glance whether the vectors mean anything.
+fn embed(args: &Args, path: &Path) {
+    let m = load(path);
+    let tok = tokenizer_for(args, path, Some(&m.store));
+    let pool = args
+        .get("pool")
+        .map(|p| moe::Pool::parse(p).unwrap_or_else(|| fail(format!("unknown pooling '{p}' (mean, last, first)"))))
+        .unwrap_or_default();
+    let normalize = !args.on("no-normalize");
+    let ctx = args.get("ctx").and_then(|v| v.parse().ok()).unwrap_or_else(|| m.spec.max_ctx.min(4096));
+
+    let encode = |text: &str| -> Vec<u32> {
+        match tok.as_ref() {
+            Some(t) => t.encode(text, m.spec.bos),
+            None => fail("no tokenizer found; pass --tokenizer"),
+        }
+    };
+    let vector = |text: &str| -> Vec<f32> {
+        let ids = encode(text);
+        if ids.is_empty() {
+            fail("empty text");
+        }
+        if ids.len() > ctx {
+            fail(format!("{} tokens exceeds the context window of {ctx}", ids.len()));
+        }
+        m.embed(&ids, ctx, pool, normalize)
+    };
+
+    // A file of texts writes one vector per line, which is what a downstream
+    // index wants.
+    if let Some(file) = args.get("prompts") {
+        let text = std::fs::read_to_string(file).unwrap_or_else(|e| fail(format!("{file}: {e}")));
+        let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let mut out = String::new();
+        let t0 = Instant::now();
+        for (i, line) in lines.iter().enumerate() {
+            let v = vector(line);
+            out.push_str(&serde_json::json!({"index": i, "embedding": v}).to_string());
+            out.push('\n');
+        }
+        match args.get("out") {
+            Some(p) => {
+                std::fs::write(p, &out).unwrap_or_else(|e| fail(format!("{p}: {e}")));
+                eprintln!("wrote {} vectors to {p} in {:.1}s", lines.len(), t0.elapsed().as_secs_f32());
+            }
+            None => print!("{out}"),
+        }
+        return;
+    }
+
+    let text = args.get("prompt").unwrap_or_else(|| fail("give --prompt or --prompts"));
+    let a = vector(text);
+    if let Some(other) = args.get("vs") {
+        let b = vector(other);
+        println!("cosine {:.4}   dim {}   pooling {pool:?}", moe::cosine(&a, &b), a.len());
+        return;
+    }
+    println!("{}", serde_json::json!(a));
+    eprintln!("dim {}   pooling {pool:?}{}", a.len(), if normalize { ", unit length" } else { "" });
 }
 
 /// A short display name for a resolved model path.

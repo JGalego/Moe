@@ -11,7 +11,7 @@ use crate::draft::Lookup;
 use crate::generate::{generate, Plan};
 use crate::grammar::{Grammar, Guide};
 use crate::http::{self, Conn, Request};
-use crate::model::{Model, State};
+use crate::model::{Model, Pool, State};
 use crate::sample::Sampler;
 use crate::tokenizer::{Stream, Tokenizer};
 use serde_json::{json, Value};
@@ -185,6 +185,8 @@ pub struct Server {
     pub cors: bool,
     /// Tokens to draft per step; 0 disables speculation.
     pub lookahead: usize,
+    /// How /v1/embeddings pools hidden states.
+    pub pool: Pool,
 }
 
 struct Params {
@@ -236,6 +238,7 @@ impl Server {
             prefix_cache,
             cors: false,
             lookahead: 0,
+            pool: Pool::Mean,
         }
     }
 
@@ -448,6 +451,64 @@ impl Server {
         }
     }
 
+    /// `POST /v1/embeddings`.
+    ///
+    /// Embedding is stateless — no cache to reuse, no tokens to sample — so a
+    /// batch is just a loop, and it does not touch the generation session at all.
+    fn embeddings(&self, req: &Request, conn: &mut Conn) {
+        let body: Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(e) => return drop(conn.error(400, &format!("invalid JSON: {e}"))),
+        };
+        // An empty batch is a client mistake, not a request for zero vectors.
+        if matches!(&body["input"], Value::Array(a) if a.is_empty()) {
+            return drop(conn.error(400, "input is empty"));
+        }
+        // `input` is a string, a list of strings, token ids, or a list of those.
+        let inputs: Vec<Result<Vec<u32>, String>> = match &body["input"] {
+            Value::String(s) => vec![self.encode(s, true)],
+            Value::Array(a) if a.iter().all(|v| v.is_u64()) && !a.is_empty() => {
+                vec![Ok(a.iter().map(|v| v.as_u64().unwrap_or(0) as u32).collect())]
+            }
+            Value::Array(a) => a
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => self.encode(s, true),
+                    Value::Array(ids) => Ok(ids.iter().map(|i| i.as_u64().unwrap_or(0) as u32).collect()),
+                    _ => Err("each input must be a string or an array of token ids".into()),
+                })
+                .collect(),
+            _ => return drop(conn.error(400, "input must be a string, an array of strings, or token ids")),
+        };
+
+        let ctx = match self.session.lock() {
+            Ok(s) => s.state.ctx,
+            Err(_) => return drop(conn.error(400, "session poisoned")),
+        };
+        let mut data = Vec::new();
+        let mut total = 0usize;
+        for (i, ids) in inputs.into_iter().enumerate() {
+            let ids = match ids {
+                Ok(v) if v.is_empty() => return drop(conn.error(400, "empty input")),
+                Ok(v) if v.len() > ctx => {
+                    return drop(conn.error(400, &format!("input {i} is {} tokens, over the {ctx} window", v.len())))
+                }
+                Ok(v) => v,
+                Err(e) => return drop(conn.error(400, &e)),
+            };
+            total += ids.len();
+            let v = self.model.embed(&ids, ctx, self.pool, true);
+            data.push(json!({"object": "embedding", "index": i, "embedding": v}));
+        }
+        let out = json!({
+            "object": "list",
+            "data": data,
+            "model": self.name,
+            "usage": {"prompt_tokens": total, "total_tokens": total},
+        });
+        drop(conn.json(200, &out.to_string()))
+    }
+
     fn completions(&self, req: &Request, conn: &mut Conn, chat: bool) {
         let body: Value = match serde_json::from_slice(&req.body) {
             Ok(v) => v,
@@ -532,6 +593,7 @@ impl Server {
         match route {
             "/v1/chat/completions" => self.completions(req, conn, true),
             "/v1/completions" => self.completions(req, conn, false),
+            "/v1/embeddings" => self.embeddings(req, conn),
             _ => drop(conn.error(404, "not found")),
         }
         self.queued.fetch_sub(1, Ordering::SeqCst);

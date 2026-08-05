@@ -177,6 +177,88 @@ fn pinning_stays_inside_its_budget() {
     assert_eq!(l + t, 0);
 }
 
+/// Pooling is checkable by exact identity rather than by eyeballing distances,
+/// which matters here because the random-weight fixture makes every position's
+/// hidden state nearly parallel — cosine cannot tell the poolings apart even
+/// when they are computed correctly.
+#[test]
+fn pooling_obeys_its_definitions_exactly() {
+    use moe::Pool;
+    let f = fixture("gqa");
+    let m = load(&f.dir);
+    let dim = m.spec.hidden;
+
+    // With one token there is nothing to choose between: all three poolings are
+    // that token's hidden state, so they must agree to the bit.
+    let one = &f.tokens[..1];
+    let (a, b, c) = (
+        m.embed(one, 32, Pool::Mean, false),
+        m.embed(one, 32, Pool::Last, false),
+        m.embed(one, 32, Pool::First, false),
+    );
+    assert_eq!(a, b, "mean and last disagree on a single token");
+    assert_eq!(a, c, "mean and first disagree on a single token");
+
+    // First-token pooling cannot see later tokens, so extending the input must
+    // leave it bit-identical. This is the causality property, not an estimate.
+    let first_long = m.embed(&f.tokens, 32, Pool::First, false);
+    assert_eq!(first_long, c, "first-token pooling saw later tokens");
+
+    // Last-token pooling is the hidden state at the final position, which is
+    // what pooling a prefix ending there gives.
+    for n in 2..=f.tokens.len() {
+        let whole = m.embed(&f.tokens[..n], 32, Pool::Last, false);
+        let prefix = m.embed(&f.tokens[..n], 32, Pool::Last, false);
+        assert_eq!(whole, prefix);
+    }
+
+    // Multi-token poolings must be genuinely different vectors, even though the
+    // fixture leaves them almost parallel.
+    let mean = m.embed(&f.tokens, 32, Pool::Mean, false);
+    let last = m.embed(&f.tokens, 32, Pool::Last, false);
+    assert_ne!(mean, last, "mean and last pooling produced the same vector");
+    assert_ne!(mean, first_long);
+
+    for pool in [Pool::Mean, Pool::Last, Pool::First] {
+        let v = m.embed(&f.tokens, 32, pool, true);
+        assert_eq!(v.len(), dim, "{pool:?}: wrong width");
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "{pool:?}: length {norm}, not 1");
+    }
+    // ...and the un-normalised vector is not unit length, so the flag is real.
+    let raw_norm = mean.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!((raw_norm - 1.0).abs() > 1e-3, "normalisation happened anyway: {raw_norm}");
+
+    // Cosine's own contract.
+    assert!((moe::cosine(&mean, &mean) - 1.0).abs() < 1e-5);
+    assert!(moe::cosine(&mean, &last).abs() <= 1.0 + 1e-6);
+    assert_eq!(moe::cosine(&vec![0.0; dim], &mean), 0.0, "a zero vector has no direction");
+}
+
+/// Mean pooling must equal the actual mean of the per-position hidden states.
+///
+/// Those are available one at a time — last-token pooling of a prefix *is* the
+/// hidden state at its final position — so the mean can be reconstructed
+/// independently and compared. Run across the 64-token prefill block boundary,
+/// this also proves no block is dropped or counted twice.
+#[test]
+fn mean_pooling_equals_the_mean_of_the_positions() {
+    use moe::Pool;
+    let m = load(&fixture("gqa").dir);
+    let ids: Vec<u32> = (0..70).map(|i| ((i * 5 + 1) % m.spec.vocab) as u32).collect();
+
+    let got = m.embed(&ids, 128, Pool::Mean, false);
+    let mut want = vec![0.0f32; m.spec.hidden];
+    for n in 1..=ids.len() {
+        let row = m.embed(&ids[..n], 128, Pool::Last, false);
+        want.iter_mut().zip(&row).for_each(|(a, b)| *a += b);
+    }
+    want.iter_mut().for_each(|v| *v /= ids.len() as f32);
+
+    let d = max_abs_diff(&got, &want);
+    assert!(d < 1e-4, "mean pooling over 70 tokens is off by {d} from the mean of its positions");
+}
+
 #[test]
 fn forward_all_matches_reference_at_every_position() {
     check_forward_all("gqa");

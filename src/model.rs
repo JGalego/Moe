@@ -224,6 +224,43 @@ fn softmax(x: &mut [f32]) {
     }
 }
 
+/// Which position, or positions, an embedding is pooled from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Pool {
+    /// Average every position. What most sentence encoders expect.
+    #[default]
+    Mean,
+    /// The final position only — which, under a causal mask, is the only one
+    /// that has seen the whole input, and is what decoder-only embedding models
+    /// are usually trained for.
+    Last,
+    /// The first position, for encoders trained with a leading marker token.
+    First,
+}
+
+impl Pool {
+    pub fn parse(s: &str) -> Option<Pool> {
+        Some(match s {
+            "mean" | "avg" => Pool::Mean,
+            "last" => Pool::Last,
+            "first" | "cls" => Pool::First,
+            _ => return None,
+        })
+    }
+}
+
+/// Cosine similarity of two equal-length vectors, in `-1..=1`.
+pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let nb = b.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
+}
+
 /// Rotary embedding, half-split (the layout Hugging Face checkpoints use).
 ///
 /// `inv` holds one inverse frequency per rotated pair, resolved once at load —
@@ -460,6 +497,51 @@ impl Model {
         let mut logits = vec![0.0f32; t * vocab];
         matmul(&self.lm_head, &nx, &mut logits);
         logits
+    }
+
+    /// Which position, or positions, an embedding is taken from.
+    ///
+    /// Mean pooling averages every token and is what most sentence encoders
+    /// expect; last-token pooling is what decoder-only embedding models are
+    /// usually trained for, since only the final position has seen the whole
+    /// input under a causal mask.
+    ///
+    /// Run `hidden` for the whole sequence and pool it into one vector.
+    ///
+    /// The residual stream is put through the same final norm that feeds the
+    /// unembedding, which is what a Hugging Face model calls its last hidden
+    /// state — so a vector from here is comparable with one from there.
+    pub fn embed(&self, tokens: &[u32], ctx: usize, pool: Pool, normalize: bool) -> Vec<f32> {
+        let h = self.spec.hidden;
+        let mut st = State::new(self, ctx.max(tokens.len()).max(1));
+        let mut acc = vec![0.0f32; h];
+        let mut seen = 0usize;
+        let mut row = vec![0.0f32; h];
+        // Blocked like a prefill, so the scratch never scales with the input.
+        for chunk in tokens.chunks(64) {
+            let x = self.trunk(chunk, &mut st);
+            for i in 0..chunk.len() {
+                rmsnorm(&x[i * h..(i + 1) * h], &self.out_norm, self.spec.eps, &mut row);
+                match pool {
+                    Pool::Mean => acc.iter_mut().zip(&row).for_each(|(a, b)| *a += b),
+                    // Overwritten every position; what survives is the last.
+                    Pool::Last => acc.copy_from_slice(&row),
+                    Pool::First if seen + i == 0 => acc.copy_from_slice(&row),
+                    Pool::First => {}
+                }
+            }
+            seen += chunk.len();
+        }
+        if pool == Pool::Mean && seen > 0 {
+            acc.iter_mut().for_each(|v| *v /= seen as f32);
+        }
+        if normalize {
+            let n = acc.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if n > 0.0 {
+                acc.iter_mut().for_each(|v| *v /= n);
+            }
+        }
+        acc
     }
 
     /// Final norm plus the unembedding, for one residual-stream row.

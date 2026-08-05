@@ -40,7 +40,7 @@ pub use eval::Score;
 pub use fetch::{cache_dir, resolve, Source};
 pub use generate::{Outcome, Plan, Stop};
 pub use grammar::{Grammar, Guide};
-pub use model::{Model, Route, State, Stats, Trace};
+pub use model::{cosine, Model, Pool, Route, State, Stats, Trace};
 pub use quant::{Dt, QT};
 pub use route::Counts;
 pub use sample::{Rng, Sampler};
